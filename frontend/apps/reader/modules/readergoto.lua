@@ -1,30 +1,26 @@
 local Event = require("ui/event")
-local InputContainer = require("ui/widget/container/inputcontainer")
 local InputDialog = require("ui/widget/inputdialog")
-local SkimToWidget = require("apps/reader/skimtowidget")
+local SkimToWidget = require("ui/widget/skimtowidget")
 local UIManager = require("ui/uimanager")
+local WidgetContainer = require("ui/widget/container/widgetcontainer")
 local _ = require("gettext")
 local T = require("ffi/util").template
 
-local ReaderGoto = InputContainer:new{
-    goto_menu_title = _("Go to"),
-    skim_menu_title = _("Skim document"),
-}
+local ReaderGoto = WidgetContainer:extend{}
 
 function ReaderGoto:init()
     self.ui.menu:registerToMainMenu(self)
 end
 
 function ReaderGoto:addToMainMenu(menu_items)
-    -- insert goto command to main reader menu
     menu_items.go_to = {
-        text = self.goto_menu_title,
+        text = _("Go to page"),
         callback = function()
             self:onShowGotoDialog()
         end,
     }
     menu_items.skim_to = {
-        text = self.skim_menu_title,
+        text = _("Skim document"),
         callback = function()
             self:onShowSkimtoDialog()
         end,
@@ -32,25 +28,7 @@ function ReaderGoto:addToMainMenu(menu_items)
 end
 
 function ReaderGoto:onShowGotoDialog()
-    local dialog_title, goto_btn, curr_page
-    if self.document.info.has_pages then
-        dialog_title = _("Go to Page")
-        goto_btn = {
-            is_enter_default = true,
-            text = _("Page"),
-            callback = function() self:gotoPage() end,
-        }
-        curr_page = self.ui.paging.current_page
-    else
-        dialog_title = _("Go to Location")
-        goto_btn = {
-            is_enter_default = true,
-            text = _("Location"),
-            callback = function() self:gotoPage() end,
-        }
-        -- only CreDocument has this method
-        curr_page = self.document:getCurrentPage()
-    end
+    local curr_page = self.ui:getCurrentPage()
     local input_hint
     if self.ui.pagemap and self.ui.pagemap:wantsPageLabels() then
         input_hint = T("@%1 (%2 - %3)", self.ui.pagemap:getCurrentPageLabel(true),
@@ -59,39 +37,50 @@ function ReaderGoto:onShowGotoDialog()
     else
         input_hint = T("@%1 (1 - %2)", curr_page, self.document:getPageCount())
     end
+    input_hint = input_hint .. string.format("  %.2f%%", curr_page / self.document:getPageCount() * 100)
     self.goto_dialog = InputDialog:new{
-        title = dialog_title,
+        title = _("Enter page number or percentage"),
         input_hint = input_hint,
+        input_type = "number",
+        description = self.document:hasHiddenFlows() and
+            _([[
+x for an absolute page number
+[x] for a page number in the main (linear) flow
+[x]y for a page number in the non-linear fragment y]])
+            or nil,
         buttons = {
             {
                 {
+                    text = _("Skim"),
+                    callback = function()
+                        self:close()
+                        self:onShowSkimtoDialog()
+                    end,
+                },
+                {
+                    text = _("Go to %"),
+                    callback = function()
+                        self:gotoPercent()
+                    end,
+                }
+            },
+            {
+                {
                     text = _("Cancel"),
-                    enabled = true,
+                    id = "close",
                     callback = function()
                         self:close()
                     end,
                 },
                 {
-                    text = _("Skim mode"),
-                    enabled = true,
+                    text = _("Go to page"),
+                    is_enter_default = true,
                     callback = function()
-                        self:close()
-                        self.skimto = SkimToWidget:new{
-                            document = self.document,
-                            ui = self.ui,
-                            callback_switch_to_goto = function()
-                                UIManager:close(self.skimto)
-                                self:onShowGotoDialog()
-                            end,
-                        }
-                        UIManager:show(self.skimto)
-
+                        self:gotoPage()
                     end,
-                },
-                goto_btn,
+                }
             },
         },
-        input_type = "number",
     }
     UIManager:show(self.goto_dialog)
     self.goto_dialog:onShowKeyboard()
@@ -99,7 +88,6 @@ end
 
 function ReaderGoto:onShowSkimtoDialog()
     self.skimto = SkimToWidget:new{
-        document = self.document,
         ui = self.ui,
         callback_switch_to_goto = function()
             UIManager:close(self.skimto)
@@ -134,22 +122,86 @@ function ReaderGoto:gotoPage()
             end
         end
         self:close()
+    elseif self.ui.document:hasHiddenFlows() then
+        -- if there are hidden flows, we accept the syntax [x]y
+        -- for page number x in flow number y (y defaults to 0 if not present)
+        local flow
+        number, flow = string.match(page_number, "^ *%[(%d+)%](%d*) *$")
+        flow = tonumber(flow) or 0
+        number = tonumber(number)
+        if number then
+            if self.ui.document.flows[flow] ~= nil then
+                if number < 1 or number > self.ui.document:getTotalPagesInFlow(flow) then
+                    return
+                end
+                local page = 0
+                -- in flow 0 (linear), we count pages skipping non-linear flows,
+                -- in a non-linear flow the target page is immediate
+                if flow == 0 then
+                    for i=1, number do
+                        page = self.ui.document:getNextPage(page)
+                    end
+                else
+                    page = self.ui.document:getFirstPageInFlow(flow) + number - 1
+                end
+                if page > 0 then
+                    self.ui:handleEvent(Event:new("GotoPage", page))
+                    self:close()
+                end
+            end
+        end
+    end
+end
+
+function ReaderGoto:gotoPercent()
+    local number = self.goto_dialog:getInputValue()
+    if number then
+        self.ui.link:addCurrentLocationToStack()
+        self.ui:handleEvent(Event:new("GotoPercent", number))
+        self:close()
     end
 end
 
 function ReaderGoto:onGoToBeginning()
-    self.ui.link:addCurrentLocationToStack()
-    self.ui:handleEvent(Event:new("GotoPage", 1))
+    local new_page = self.ui.document:getNextPage(0)
+    if new_page then
+        self.ui.link:addCurrentLocationToStack()
+        self.ui:handleEvent(Event:new("GotoPage", new_page))
+    end
     return true
 end
 
 function ReaderGoto:onGoToEnd()
-    local endpage = self.document:getPageCount()
-    if endpage then
+    local new_page = self.ui.document:getPrevPage(0)
+    if new_page then
         self.ui.link:addCurrentLocationToStack()
-        self.ui:handleEvent(Event:new("GotoPage", endpage))
+        self.ui:handleEvent(Event:new("GotoPage", new_page))
     end
     return true
+end
+
+function ReaderGoto:onGoToRandomPage()
+    local page_count = self.document:getPageCount()
+    if page_count == 1 then return true end
+    local current_page = self.ui:getCurrentPage()
+    if self.pages_pool == nil then
+        self.pages_pool = {}
+    end
+    if #self.pages_pool == 0 or (#self.pages_pool == 1 and self.pages_pool[1] == current_page) then
+        for i = 1, page_count do
+            self.pages_pool[i] = i
+        end
+    end
+    while true do
+        local random_page_idx = math.random(1, #self.pages_pool)
+        local random_page = self.pages_pool[random_page_idx]
+        if random_page ~= current_page then
+            table.remove(self.pages_pool, random_page_idx)
+            self.ui.link:addCurrentLocationToStack()
+            self.ui:handleEvent(Event:new("GotoPage", random_page))
+            return true
+        end
+    end
 end
 
 return ReaderGoto

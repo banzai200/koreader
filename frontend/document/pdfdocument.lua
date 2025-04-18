@@ -1,6 +1,7 @@
-local Cache = require("cache")
+local BlitBuffer = require("ffi/blitbuffer")
 local CacheItem = require("cacheitem")
 local CanvasContext = require("document/canvascontext")
+local DocCache = require("document/doccache")
 local DocSettings = require("docsettings")
 local Document = require("document/document")
 local DrawContext = require("ffi/drawcontext")
@@ -10,7 +11,7 @@ local ffi = require("ffi")
 local C = ffi.C
 local pdf = nil
 
-local PdfDocument = Document:new{
+local PdfDocument = Document:extend{
     _document = false,
     is_pdf = true,
     dc_null = DrawContext.new(),
@@ -21,12 +22,6 @@ local PdfDocument = Document:new{
 
 function PdfDocument:init()
     if not pdf then pdf = require("ffi/mupdf") end
-    -- mupdf.color has to stay false for kopt to work correctly
-    -- and be accurate (including its job about showing highlight
-    -- boxes). We will turn it on and off in PdfDocument:preRenderPage()
-    -- and :postRenderPage() when mupdf is called without kopt involved.
-    pdf.color = false
-    self:updateColorRendering()
     self.koptinterface = require("document/koptinterface")
     self.koptinterface:setDefaultConfigurable(self.configurable)
     local ok
@@ -34,6 +29,7 @@ function PdfDocument:init()
     if not ok then
         error(self._document)  -- will contain error message
     end
+    self:updateColorRendering()
     self.is_reflowable = self._document:isDocumentReflowable()
     self.reflowable_font_size = self:convertKoptToReflowableFontSize()
     -- no-op on PDF
@@ -41,10 +37,18 @@ function PdfDocument:init()
     self.is_open = true
     self.info.has_pages = true
     self.info.configurable = true
+    self.render_mode = 0
     if self._document:needsPassword() then
         self.is_locked = true
     else
         self:_readMetadata()
+    end
+end
+
+function PdfDocument:updateColorRendering()
+    Document.updateColorRendering(self) -- will set self.render_color
+    if self._document then
+        self._document:setColorRendering(self.render_color)
     end
 end
 
@@ -74,19 +78,11 @@ function PdfDocument:convertKoptToReflowableFontSize(font_size)
         return size * default_font_size
     elseif G_reader_settings:readSetting("kopt_font_size") then
         return G_reader_settings:readSetting("kopt_font_size") * default_font_size
-    elseif DKOPTREADER_CONFIG_FONT_SIZE then
-        return DKOPTREADER_CONFIG_FONT_SIZE * default_font_size
+    elseif G_defaults:readSetting("DKOPTREADER_CONFIG_FONT_SIZE") then
+        return G_defaults:readSetting("DKOPTREADER_CONFIG_FONT_SIZE") * default_font_size
     else
         return default_font_size
     end
-end
-
-function PdfDocument:preRenderPage()
-    pdf.color = self.render_color
-end
-
-function PdfDocument:postRenderPage()
-    pdf.color = false
 end
 
 function PdfDocument:unlock(password)
@@ -98,11 +94,26 @@ function PdfDocument:unlock(password)
     return true
 end
 
+function PdfDocument:comparePositions(pos1, pos2)
+    return self.koptinterface:comparePositions(self, pos1, pos2)
+end
+
 function PdfDocument:getPageTextBoxes(pageno)
-    local page = self._document:openPage(pageno)
-    local text = page:getPageText()
-    page:close()
-    return text
+    local hash = "textbox|"..self.file.."|"..pageno
+    local cached = DocCache:check(hash)
+    if not cached then
+        local page = self._document:openPage(pageno)
+        local text = page:getPageText()
+        page:close()
+        DocCache:insert(hash, CacheItem:new{text=text, size=text.size})
+        return text
+    else
+        return cached.text
+    end
+end
+
+function PdfDocument:getPanelFromPage(pageno, pos)
+    return self.koptinterface:getPanelFromPage(self, pageno, pos)
 end
 
 function PdfDocument:getWordFromPosition(spos)
@@ -113,12 +124,20 @@ function PdfDocument:getTextFromPositions(spos0, spos1)
     return self.koptinterface:getTextFromPositions(self, spos0, spos1)
 end
 
+function PdfDocument:getTextBoxes(pageno)
+    return self.koptinterface:getTextBoxes(self, pageno)
+end
+
 function PdfDocument:getPageBoxesFromPositions(pageno, ppos0, ppos1)
     return self.koptinterface:getPageBoxesFromPositions(self, pageno, ppos0, ppos1)
 end
 
 function PdfDocument:nativeToPageRectTransform(pageno, rect)
     return self.koptinterface:nativeToPageRectTransform(self, pageno, rect)
+end
+
+function PdfDocument:getSelectedWordContext(word, nb_words, pos)
+    return self.koptinterface:getSelectedWordContext(word, nb_words, pos)
 end
 
 function PdfDocument:getOCRWord(pageno, wbox)
@@ -135,7 +154,7 @@ end
 
 function PdfDocument:getUsedBBox(pageno)
     local hash = "pgubbox|"..self.file.."|"..self.reflowable_font_size.."|"..pageno
-    local cached = Cache:check(hash)
+    local cached = DocCache:check(hash)
     if cached then
         return cached.ubbox
     end
@@ -148,9 +167,9 @@ function PdfDocument:getUsedBBox(pageno)
     if used.x1 > pwidth then used.x1 = pwidth end
     if used.y0 < 0 then used.y0 = 0 end
     if used.y1 > pheight then used.y1 = pheight end
-    --- @todo Give size for cacheitem?  02.12 2012 (houqp)
-    Cache:insert(hash, CacheItem:new{
+    DocCache:insert(hash, CacheItem:new{
         ubbox = used,
+        size = 256, -- might be closer to 160
     })
     page:close()
     return used
@@ -158,58 +177,119 @@ end
 
 function PdfDocument:getPageLinks(pageno)
     local hash = "pglinks|"..self.file.."|"..self.reflowable_font_size.."|"..pageno
-    local cached = Cache:check(hash)
+    local cached = DocCache:check(hash)
     if cached then
         return cached.links
     end
     local page = self._document:openPage(pageno)
     local links = page:getPageLinks()
-    Cache:insert(hash, CacheItem:new{
+    DocCache:insert(hash, CacheItem:new{
         links = links,
+        size = 64 + (8 * 32 * #links),
     })
     page:close()
     return links
 end
 
-function PdfDocument:saveHighlight(pageno, item)
+-- returns nil if file is not a pdf, true if document is a writable pdf, false else
+function PdfDocument:_checkIfWritable()
     local suffix = util.getFileNameSuffix(self.file)
-    if string.lower(suffix) ~= "pdf" then return end
-
+    if string.lower(suffix) ~= "pdf" then return nil end
     if self.is_writable == nil then
         local handle = io.open(self.file, 'r+b')
         self.is_writable = handle ~= nil
         if handle then handle:close() end
     end
-    if self.is_writable == false then
-        return false
-    end
-    self.is_edited = true
+    return self.is_writable
+end
+
+local function _quadpointsFromPboxes(pboxes)
     -- will also need mupdf_h.lua to be evaluated once
     -- but this is guaranteed at this point
-    local n = #item.pboxes
-    local quadpoints = ffi.new("float[?]", 8*n)
+    local n = #pboxes
+    local quadpoints = ffi.new("fz_quad[?]", n)
     for i=1, n do
         -- The order must be left bottom, right bottom, left top, right top.
         -- https://bugs.ghostscript.com/show_bug.cgi?id=695130
-        quadpoints[8*i-8] = item.pboxes[i].x
-        quadpoints[8*i-7] = item.pboxes[i].y + item.pboxes[i].h
-        quadpoints[8*i-6] = item.pboxes[i].x + item.pboxes[i].w
-        quadpoints[8*i-5] = item.pboxes[i].y + item.pboxes[i].h
-        quadpoints[8*i-4] = item.pboxes[i].x
-        quadpoints[8*i-3] = item.pboxes[i].y
-        quadpoints[8*i-2] = item.pboxes[i].x + item.pboxes[i].w
-        quadpoints[8*i-1] = item.pboxes[i].y
+        quadpoints[i-1].ll.x = pboxes[i].x
+        quadpoints[i-1].ll.y = pboxes[i].y + pboxes[i].h - 1
+        quadpoints[i-1].lr.x = pboxes[i].x + pboxes[i].w - 1
+        quadpoints[i-1].lr.y = pboxes[i].y + pboxes[i].h - 1
+        quadpoints[i-1].ul.x = pboxes[i].x
+        quadpoints[i-1].ul.y = pboxes[i].y
+        quadpoints[i-1].ur.x = pboxes[i].x + pboxes[i].w - 1
+        quadpoints[i-1].ur.y = pboxes[i].y
     end
+    return quadpoints, n
+end
+
+local function _quadpointsToPboxes(quadpoints, n)
+    -- reverse of previous function
+    local pboxes = {}
+    for i=1, n do
+        table.insert(pboxes, {
+            x = quadpoints[i-1].ul.x,
+            y = quadpoints[i-1].ul.y,
+            w = quadpoints[i-1].lr.x - quadpoints[i-1].ul.x + 1,
+            h = quadpoints[i-1].lr.y - quadpoints[i-1].ul.y + 1,
+        })
+    end
+    return pboxes
+end
+
+function PdfDocument:saveHighlight(pageno, item)
+    local can_write = self:_checkIfWritable()
+    if can_write ~= true then return can_write end
+
+    self.is_edited = true
+    local quadpoints, n = _quadpointsFromPboxes(item.pboxes)
     local page = self._document:openPage(pageno)
     local annot_type = C.PDF_ANNOT_HIGHLIGHT
+    local annot_color = item.color and BlitBuffer.colorFromName(item.color)
     if item.drawer == "lighten" then
         annot_type = C.PDF_ANNOT_HIGHLIGHT
     elseif item.drawer == "underscore" then
         annot_type = C.PDF_ANNOT_UNDERLINE
     elseif item.drawer == "strikeout" then
-        annot_type = C.PDF_ANNOT_STRIKEOUT
+        annot_type = C.PDF_ANNOT_STRIKE_OUT
     end
-    page:addMarkupAnnotation(quadpoints, n, annot_type)
+    -- NOTE: For highlights, display style may differ compared to ReaderView:drawHighlightRect...
+    --       (e.g., we do a MUL blend, MuPDF currently appears to do an OVER blend).
+    page:addMarkupAnnotation(quadpoints, n, annot_type, annot_color) -- may update/adjust quadpoints
+    -- Update pboxes with the possibly adjusted coordinates (this will have it updated
+    -- in self.view.highlight.saved[page])
+    item.pboxes = _quadpointsToPboxes(quadpoints, n)
+    page:close()
+    self:resetTileCacheValidity()
+end
+
+function PdfDocument:deleteHighlight(pageno, item)
+    local can_write = self:_checkIfWritable()
+    if can_write ~= true then return can_write end
+
+    self.is_edited = true
+    local quadpoints, n = _quadpointsFromPboxes(item.pboxes)
+    local page = self._document:openPage(pageno)
+    local annot = page:getMarkupAnnotation(quadpoints, n)
+    if annot ~= nil then
+        page:deleteMarkupAnnotation(annot)
+        self:resetTileCacheValidity()
+    end
+    page:close()
+end
+
+function PdfDocument:updateHighlightContents(pageno, item, contents)
+    local can_write = self:_checkIfWritable()
+    if can_write ~= true then return can_write end
+
+    self.is_edited = true
+    local quadpoints, n = _quadpointsFromPboxes(item.pboxes)
+    local page = self._document:openPage(pageno)
+    local annot = page:getMarkupAnnotation(quadpoints, n)
+    if annot ~= nil then
+        page:updateMarkupAnnotation(annot, contents)
+        self:resetTileCacheValidity()
+    end
     page:close()
 end
 
@@ -219,28 +299,17 @@ function PdfDocument:writeDocument()
 end
 
 function PdfDocument:close()
-    if self.is_edited then
-        self:writeDocument()
-    end
-    Document.close(self)
-end
-
-function PdfDocument:getProps()
-    local props = self._document:getMetadata()
-    if props.title == "" then
-        local startPos = util.lastIndexOf(self.file, "%/")
-        if startPos > 0  then
-            props.title = string.sub(self.file, startPos + 1, -5) --remove extension .pdf
-        else
-            props.title = string.sub(self.file, 0, -5)
+    -- NOTE: We can't just rely on Document:close's return code for that, as we need self._document
+    --       in :writeDocument, and it would have been destroyed.
+    local DocumentRegistry = require("document/documentregistry")
+    if DocumentRegistry:getReferenceCount(self.file) == 1 then
+        -- We're the final reference to this Document instance.
+        if self.is_edited then
+            self:writeDocument()
         end
     end
-    props.authors = props.author
-    props.series = ""
-    props.language = ""
-    props.keywords = props.keywords
-    props.description = props.subject
-    return props
+
+    Document.close(self)
 end
 
 function PdfDocument:getLinkFromPosition(pageno, pos)
@@ -267,36 +336,47 @@ function PdfDocument:getCoverPageImage()
     return self.koptinterface:getCoverPageImage(self)
 end
 
-function PdfDocument:findText(pattern, origin, reverse, caseInsensitive, page)
-    return self.koptinterface:findText(self, pattern, origin, reverse, caseInsensitive, page)
+function PdfDocument:findText(pattern, origin, reverse, case_insensitive, page)
+    return self.koptinterface:findText(self, pattern, origin, reverse, case_insensitive, page)
 end
 
-function PdfDocument:renderPage(pageno, rect, zoom, rotation, gamma, render_mode)
-    return self.koptinterface:renderPage(self, pageno, rect, zoom, rotation, gamma, render_mode)
+function PdfDocument:findAllText(pattern, case_insensitive, nb_context_words, max_hits)
+    return self.koptinterface:findAllText(self, pattern, case_insensitive, nb_context_words, max_hits)
 end
 
-function PdfDocument:hintPage(pageno, zoom, rotation, gamma, render_mode)
-    return self.koptinterface:hintPage(self, pageno, zoom, rotation, gamma, render_mode)
+function PdfDocument:renderPage(pageno, rect, zoom, rotation, gamma, hinting)
+    return self.koptinterface:renderPage(self, pageno, rect, zoom, rotation, gamma, hinting)
 end
 
-function PdfDocument:drawPage(target, x, y, rect, pageno, zoom, rotation, gamma, render_mode)
-    return self.koptinterface:drawPage(self, target, x, y, rect, pageno, zoom, rotation, gamma, render_mode)
+function PdfDocument:hintPage(pageno, zoom, rotation, gamma)
+    return self.koptinterface:hintPage(self, pageno, zoom, rotation, gamma)
+end
+
+function PdfDocument:drawPage(target, x, y, rect, pageno, zoom, rotation, gamma)
+    return self.koptinterface:drawPage(self, target, x, y, rect, pageno, zoom, rotation, gamma)
 end
 
 function PdfDocument:register(registry)
     --- Document types ---
     registry:addProvider("cbt", "application/vnd.comicbook+tar", self, 100)
     registry:addProvider("cbz", "application/vnd.comicbook+zip", self, 100)
+    registry:addProvider("cbz", "application/x-cbz", self, 100) -- Alternative mimetype for OPDS.
+    registry:addProvider("cfb", "application/octet-stream", self, 80) -- Compound File Binary, a Microsoft general-purpose file with a file-system-like structure.
+    registry:addProvider("docx", "application/vnd.openxmlformats-officedocument.wordprocessingml.document", self, 80)
     registry:addProvider("epub", "application/epub+zip", self, 50)
     registry:addProvider("epub3", "application/epub+zip", self, 50)
     registry:addProvider("fb2", "application/fb2", self, 80)
     registry:addProvider("htm", "text/html", self, 90)
     registry:addProvider("html", "text/html", self, 90)
+    registry:addProvider("mobi", "application/x-mobipocket-ebook", self, 80)
     registry:addProvider("pdf", "application/pdf", self, 100)
+    registry:addProvider("pptx", "application/vnd.openxmlformats-officedocument.presentationml.presentation", self, 80)
     registry:addProvider("tar", "application/x-tar", self, 10)
-    registry:addProvider("xhtml", "application/xhtml+xml", self, 100)
+    registry:addProvider("txt", "text/plain", self, 80)
+    registry:addProvider("xhtml", "application/xhtml+xml", self, 90)
     registry:addProvider("xml", "application/xml", self, 10)
     registry:addProvider("xps", "application/oxps", self, 100)
+    registry:addProvider("xlsx", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", self, 80)
     registry:addProvider("zip", "application/zip", self, 20)
 
     --- Picture types ---
@@ -315,7 +395,7 @@ function PdfDocument:register(registry)
     registry:addProvider("png", "image/png", self, 90)
     registry:addProvider("pnm", "image/x‑portable‑bitmap", self, 90)
     registry:addProvider("ppm", "image/x‑portable‑bitmap", self, 90)
-    registry:addProvider("svg", "image/svg+xml", self, 90)
+    registry:addProvider("svg", "image/svg+xml", self, 80)
     registry:addProvider("tif", "image/tiff", self, 90)
     registry:addProvider("tiff", "image/tiff", self, 90)
     -- Windows Media Photo == JPEG XR

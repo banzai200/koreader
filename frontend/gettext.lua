@@ -23,6 +23,7 @@ local isAndroid, android = pcall(require, "android")
 local logger = require("logger")
 
 local GetText = {
+    context = {},
     translation = {},
     current_lang = "C",
     dirname = "l10n",
@@ -34,7 +35,7 @@ local GetText_mt = {
     __index = {}
 }
 
--- wrapUntranslated() will be overriden by bidi.lua when UI language is RTL,
+-- wrapUntranslated() will be overridden by bidi.lua when UI language is RTL,
 -- to wrap untranslated english strings as LTR-isolated segments.
 -- It should do nothing when the UI language is LTR.
 GetText.wrapUntranslated_nowrap = function(text) return text end
@@ -57,10 +58,10 @@ Returns a translation.
     local translation = _("A meaningful message.")
 --]]
 function GetText_mt.__call(gettext, msgid)
-    return gettext.translation[msgid] or gettext.wrapUntranslated(msgid)
+    return gettext.translation[msgid] and gettext.translation[msgid][0] or gettext.translation[msgid] or gettext.wrapUntranslated(msgid)
 end
 
-local function c_escape(what)
+local function c_escape(what_full, what)
     if what == "\n" then return ""
     elseif what == "a" then return "\a"
     elseif what == "b" then return "\b"
@@ -71,7 +72,7 @@ local function c_escape(what)
     elseif what == "v" then return "\v"
     elseif what == "0" then return "\0" -- shouldn't happen, though
     else
-        return what
+        return what_full
     end
 end
 
@@ -102,7 +103,7 @@ local function getPluralFunc(pl_tests, nplurals, plural_default)
             local pl_test = pl_tests[i]
             pl_test = logicalCtoLua(pl_test)
 
-            if i > 1 and not (tonumber(pl_test) ~= nil) then
+            if i > 1 and tonumber(pl_test) == nil then
                 pl_test = " elseif "..pl_test
             end
             if tonumber(pl_test) ~= nil then
@@ -137,7 +138,7 @@ end
 
 local function addTranslation(msgctxt, msgid, msgstr, n)
     -- translated string
-    local unescaped_string = string.gsub(msgstr, "\\(.)", c_escape)
+    local unescaped_string = string.gsub(msgstr, "(\\(.))", c_escape)
     if msgctxt and msgctxt ~= "" then
         if not GetText.context[msgctxt] then
             GetText.context[msgctxt] = {}
@@ -211,6 +212,14 @@ function GetText_mt.__index.changeLang(new_lang)
                     local nplurals = plural_forms:match("nplurals=([0-9]+);") or 2
                     local plurals = plural_forms:match("plural=%((.*)%);")
 
+                    -- Hardcoded workaround for Hebrew which has 4 plural forms.
+                    if plurals == "n == 1) ? 0 : ((n == 2) ? 1 : ((n > 10 && n % 10 == 0) ? 2 : 3)" then
+                        plurals = "n == 1 ? 0 : (n == 2) ? 1 : (n > 10 && n % 10 == 0) ? 2 : 3"
+                    end
+                    -- Hardcoded workaround for Latvian.
+                    if plurals == "n % 10 == 0 || n % 100 >= 11 && n % 100 <= 19) ? 0 : ((n % 10 == 1 && n % 100 != 11) ? 1 : 2" then
+                        plurals = "n % 10 == 0 || n % 100 >= 11 && n % 100 <= 19 ? 0 : (n % 10 == 1 && n % 100 != 11) ? 1 : 2"
+                    end
                     -- Hardcoded workaround for Romanian which has 3 plural forms.
                     if plurals == "n == 1) ? 0 : ((n == 0 || n != 1 && n % 100 >= 1 && n % 100 <= 19) ? 1 : 2" then
                         plurals = "n == 1 ? 0 : (n == 0 || n != 1 && n % 100 >= 1 && n % 100 <= 19) ? 1 : 2"
@@ -263,7 +272,11 @@ function GetText_mt.__index.changeLang(new_lang)
                     s = s:gsub("\\n", "\n")
                     -- unescape " or msgid won't match
                     s = s:gsub('\\"', '"')
+                    -- unescape \\ or msgid won't match
+                    s = s:gsub("\\\\", "\\")
                     data[what] = (data[what] or "") .. s
+                elseif what and s == "" and fuzzy then -- luacheck: ignore 542
+                    -- Ignore the likes of msgid "" and msgstr ""
                 else
                     -- Don't save this fuzzy string and unset fuzzy for the next one.
                     fuzzy = false
@@ -273,6 +286,7 @@ function GetText_mt.__index.changeLang(new_lang)
             end
         end
     end
+    po:close()
     GetText.current_lang = new_lang
 end
 

@@ -1,34 +1,36 @@
 local ConfirmBox = require("ui/widget/confirmbox")
 local Device = require("device")
+local PluginShare = require("pluginshare")
 local UIManager = require("ui/uimanager")
 local WidgetContainer = require("ui/widget/container/widgetcontainer")
 local _ = require("gettext")
 
 local menuItem = {
     text = _("Keep alive"),
-    checked = false,
+    checked_func = function() return PluginShare.keepalive end,
 }
 
 local disable
 local enable
 
-local function showConfirmBox()
+local function showConfirmBox(touchmenu_instance)
     UIManager:show(ConfirmBox:new{
         text = _("The system won't sleep while this message is showing.\n\nPress \"Stay alive\" if you prefer to keep the system on even after closing this notification. *This will drain the battery*.\n\nIf KOReader terminates before \"Close\" is pressed, please start and close the KeepAlive plugin again to ensure settings are reset."),
         cancel_text = _("Close"),
         cancel_callback = function()
             disable()
-            menuItem.checked =false
+            PluginShare.keepalive = false
+            touchmenu_instance:updateItems()
         end,
         ok_text = _("Stay alive"),
         ok_callback = function()
-            menuItem.checked = true
+            PluginShare.keepalive = true
+            touchmenu_instance:updateItems()
         end,
     })
 end
 
 if Device:isCervantes() or Device:isKobo() then
-    local PluginShare = require("pluginshare")
     enable = function() PluginShare.pause_auto_suspend = true end
     disable = function() PluginShare.pause_auto_suspend = false end
 elseif Device:isKindle() then
@@ -54,12 +56,12 @@ else
     return { disabled = true, }
 end
 
-menuItem.callback = function()
+menuItem.callback = function(touchmenu_instance)
     enable()
-    showConfirmBox()
+    showConfirmBox(touchmenu_instance)
 end
 
-local KeepAlive = WidgetContainer:new{
+local KeepAlive = WidgetContainer:extend{
     name = "keepalive",
 }
 

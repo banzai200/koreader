@@ -1,236 +1,222 @@
 local BD = require("ui/bidi")
 local ButtonDialog = require("ui/widget/buttondialog")
 local InfoMessage = require("ui/widget/infomessage")
-local InputContainer = require("ui/widget/container/inputcontainer")
 local InputDialog = require("ui/widget/inputdialog")
 local Menu = require("ui/widget/menu")
-local Screen = require("device").screen
 local UIManager = require("ui/uimanager")
-local util = require("ffi/util")
+local WidgetContainer = require("ui/widget/container/widgetcontainer")
+local lfs = require("libs/libkoreader-lfs")
 local _ = require("gettext")
-local T = require("ffi/util").template
 
-local FileManagerShortcuts = InputContainer:extend{}
+local FileManagerShortcuts = WidgetContainer:extend{
+    title = _("Folder shortcuts"),
+    folder_shortcuts = G_reader_settings:readSetting("folder_shortcuts", {}),
+}
 
 function FileManagerShortcuts:updateItemTable()
     local item_table = {}
-    local folder_shortcuts = G_reader_settings:readSetting("folder_shortcuts") or {}
-    table.insert(item_table, {
-        text = _("Add new folder shortcut"),
-        callback = function()
-            self:addNewFolder()
-        end,
-    })
-    for _, item in ipairs(folder_shortcuts) do
+    for folder, item in pairs(self.folder_shortcuts) do
         table.insert(item_table, {
-            text = string.format("%s (%s)", item.text, item.folder),
-            folder = item.folder,
-            friendly_name = item.text,
-            deletable = true,
-            editable = true,
-            callback = function()
-                UIManager:close(self.fm_bookmark)
-
-                local folder = item.folder
-                if folder ~= nil and lfs.attributes(folder, "mode") == "directory" then
-                    if self.ui.file_chooser then
-                        self.ui.file_chooser:changeToPath(folder)
-                    else -- called from Reader
-                        local FileManager = require("apps/filemanager/filemanager")
-
-                        self.ui:onClose()
-                        if FileManager.instance then
-                            FileManager.instance:reinit(folder)
-                        else
-                            FileManager:showFiles(folder)
-                        end
-                    end
-                end
-            end,
+            text = string.format("%s (%s)", item.text, folder),
+            folder = folder,
+            name = item.text,
         })
     end
-
-    -- try to stay on current page
-    local select_number = nil
-
-    if self.fm_bookmark.page and self.fm_bookmark.perpage then
-        select_number = (self.fm_bookmark.page - 1) * self.fm_bookmark.perpage + 1
-    end
-
-    self.fm_bookmark:switchItemTable(nil,
-                                     item_table, select_number)
+    table.sort(item_table, function(l, r)
+        return l.text < r.text
+    end)
+    self.shortcuts_menu:switchItemTable(nil, item_table, -1)
 end
 
-function FileManagerShortcuts:addNewFolder()
+function FileManagerShortcuts:hasFolderShortcut(folder)
+    return self.folder_shortcuts[folder] and true or false
+end
+
+function FileManagerShortcuts:onMenuChoice(item)
+    local folder = item.folder
+    if lfs.attributes(folder, "mode") ~= "directory" then return end
+    if self.select_callback then
+        self.select_callback(folder)
+    else
+        if self._manager.ui.file_chooser then
+            self._manager.ui.file_chooser:changeToPath(folder)
+        else -- called from Reader
+            self._manager.ui:onClose()
+            self._manager.ui:showFileManager(folder .. "/")
+        end
+    end
+end
+
+function FileManagerShortcuts:onMenuHold(item)
+    local dialog
+    local buttons = {
+        {
+            {
+                text = _("Remove shortcut"),
+                callback = function()
+                    UIManager:close(dialog)
+                    self._manager:removeShortcut(item.folder)
+                end
+            },
+            {
+                text = _("Rename shortcut"),
+                callback = function()
+                    UIManager:close(dialog)
+                    self._manager:editShortcut(item.folder)
+                end
+            },
+        },
+        self._manager.ui.file_chooser and self._manager.ui.clipboard and {
+            {
+                text = _("Paste to folder"),
+                callback = function()
+                    UIManager:close(dialog)
+                    self._manager.ui:pasteFileFromClipboard(item.folder)
+                end
+            },
+        },
+    }
+    dialog = ButtonDialog:new{
+        title = item.name .. "\n" .. BD.dirpath(item.folder),
+        title_align = "center",
+        buttons = buttons,
+    }
+    UIManager:show(dialog)
+    return true
+end
+
+function FileManagerShortcuts:removeShortcut(folder)
+    self.folder_shortcuts[folder] = nil
+    if self.shortcuts_menu then
+        self.fm_updated = true
+        self:updateItemTable()
+    end
+end
+
+function FileManagerShortcuts:editShortcut(folder, post_callback)
+    local item = self.folder_shortcuts[folder]
+    local name = item and item.text -- rename
+    local input_dialog
+    input_dialog = InputDialog:new {
+        title = _("Enter folder shortcut name"),
+        input = name,
+        description = BD.dirpath(folder),
+        buttons = {{
+            {
+                text = _("Cancel"),
+                id = "close",
+                callback = function()
+                    UIManager:close(input_dialog)
+                end,
+            },
+            {
+                text = _("Save"),
+                is_enter_default = true,
+                callback = function()
+                    local new_name = input_dialog:getInputText()
+                    if new_name == "" or new_name == name then return end
+                    UIManager:close(input_dialog)
+                    if item then
+                        item.text = new_name
+                    else
+                        self.folder_shortcuts[folder] = { text = new_name, time = os.time() }
+                        if post_callback then
+                            post_callback()
+                        end
+                    end
+                    if self.shortcuts_menu then
+                        self.fm_updated = true
+                        self:updateItemTable()
+                    end
+                end,
+            },
+        }},
+    }
+    UIManager:show(input_dialog)
+    input_dialog:onShowKeyboard()
+end
+
+function FileManagerShortcuts:addShortcut()
     local PathChooser = require("ui/widget/pathchooser")
     local path_chooser = PathChooser:new{
         select_directory = true,
         select_file = false,
-        path = self.fm_bookmark.curr_path,
+        path = self.ui.file_chooser and self.ui.file_chooser.path or self.ui:getLastDirFile(),
         onConfirm = function(path)
-            local add_folder_input
-            local friendly_name = util.basename(path) or _("my folder")
-            add_folder_input = InputDialog:new{
-                title = self.title,
-                input = friendly_name,
-                input_type = "text",
-                description = T(_("Title for selected folder:\n%1"), BD.dirpath(path)),
-                buttons = {
-                    {
-                        {
-                            text = _("Cancel"),
-                            callback = function()
-                                UIManager:close(add_folder_input)
-                            end,
-                        },
-                        {
-                            text = _("Add"),
-                            is_enter_default = true,
-                            callback = function()
-                                self:addFolderFromInput(add_folder_input:getInputValue(), path)
-                                UIManager:close(add_folder_input)
-                            end,
-                        },
-                    }
-                },
-            }
-            UIManager:show(add_folder_input)
-            add_folder_input:onShowKeyboard()
-        end
+            if self:hasFolderShortcut(path) then
+                UIManager:show(InfoMessage:new{
+                    text = _("Shortcut already exists."),
+                })
+            else
+                self:editShortcut(path)
+            end
+        end,
     }
     UIManager:show(path_chooser)
 end
 
-function FileManagerShortcuts:addFolderFromInput(friendly_name, folder)
-    for __, item in ipairs(G_reader_settings:readSetting("folder_shortcuts") or {}) do
-        if item.text == friendly_name and item.folder == folder then
-            UIManager:show(InfoMessage:new{
-                text = _("A shortcut to this folder already exists."),
-            })
-            return
-        end
-    end
-    local folder_shortcuts = G_reader_settings:readSetting("folder_shortcuts") or {}
-    table.insert(folder_shortcuts, {
-        text = friendly_name,
-        folder = folder,
-    })
-    G_reader_settings:saveSetting("folder_shortcuts", folder_shortcuts)
-    self:updateItemTable()
-end
-
-function FileManagerShortcuts:onMenuHold(item)
-    if item.deletable or item.editable then
-        local folder_shortcuts_dialog
-        folder_shortcuts_dialog = ButtonDialog:new{
-            buttons = {
-                {
-                    {
-                        text = _("Paste file"),
-                        enabled = (self._manager.ui.file_chooser and self._manager.ui.clipboard) and true or false,
-                        callback = function()
-                            UIManager:close(folder_shortcuts_dialog)
-                            self._manager.ui:pasteHere(item.folder)
-                        end
-                    },
-                    {
-                        text = _("Edit"),
-                        enabled = item.editable,
-                        callback = function()
-                            UIManager:close(folder_shortcuts_dialog)
-                            self._manager:editFolderShortcut(item)
-                        end
-                    },
-                    {
-                        text = _("Delete"),
-                        enabled = item.deletable,
-                        callback = function()
-                            UIManager:close(folder_shortcuts_dialog)
-                            self._manager:deleteFolderShortcut(item)
-                        end
-                    },
-                },
-            }
-        }
-        UIManager:show(folder_shortcuts_dialog)
-        return true
-    end
-end
-
-function FileManagerShortcuts:editFolderShortcut(item)
-    local edit_folder_input
-    edit_folder_input = InputDialog:new {
-        title = _("Edit friendly name"),
-        input = item.friendly_name,
-        input_type = "text",
-        description = T(_("Rename title for selected folder:\n%1"), BD.dirpath(item.folder)),
-        buttons = {
-            {
-                {
-                    text = _("Cancel"),
-                    callback = function()
-                        UIManager:close(edit_folder_input)
-                    end,
-                },
-                {
-                    text = _("Apply"),
-                    is_enter_default = true,
-                    callback = function()
-                        self:renameFolderShortcut(item, edit_folder_input:getInputText())
-                        UIManager:close(edit_folder_input)
-                    end,
-                },
-            }
-        },
+function FileManagerShortcuts:genShowFolderShortcutsButton(pre_callback)
+    return {
+        text = self.title,
+        callback = function()
+            pre_callback()
+            self:onShowFolderShortcutsDialog()
+        end,
     }
-    UIManager:show(edit_folder_input)
-    edit_folder_input:onShowKeyboard()
 end
 
-function FileManagerShortcuts:renameFolderShortcut(item, new_name)
-    local folder_shortcuts = {}
-    for _, element in ipairs(G_reader_settings:readSetting("folder_shortcuts") or {}) do
-        if element.text == item.friendly_name and element.folder == item.folder then
-            element.text = new_name
-        end
-        table.insert(folder_shortcuts, element)
+function FileManagerShortcuts:genAddRemoveShortcutButton(folder, pre_callback, post_callback)
+    if self:hasFolderShortcut(folder) then
+        return {
+            text = _("Remove from folder shortcuts"),
+            callback = function()
+                pre_callback()
+                self:removeShortcut(folder)
+                post_callback()
+            end,
+        }
+    else
+        return {
+            text = _("Add to folder shortcuts"),
+            callback = function()
+                pre_callback()
+                self:editShortcut(folder, post_callback)
+            end,
+        }
     end
-    G_reader_settings:saveSetting("folder_shortcuts", folder_shortcuts)
-    self:updateItemTable()
-end
-
-function FileManagerShortcuts:deleteFolderShortcut(item)
-    local folder_shortcuts = {}
-    for _, element in ipairs(G_reader_settings:readSetting("folder_shortcuts") or {}) do
-        if element.text ~= item.friendly_name or element.folder ~= item.folder then
-            table.insert(folder_shortcuts, element)
-        end
-    end
-    G_reader_settings:saveSetting("folder_shortcuts", folder_shortcuts)
-    self:updateItemTable()
 end
 
 function FileManagerShortcuts:onSetDimensions(dimen)
     self.dimen = dimen
 end
 
-function FileManagerShortcuts:onShowFolderShortcutsDialog()
-    self.fm_bookmark = Menu:new{
-        title = _("Folder shortcuts"),
-        show_parent = self.ui,
-        width = Screen:getWidth(),
-        height = Screen:getHeight(),
-        no_title = false,
-        parent = nil,
-        has_close_button = true,
-        is_popout = false,
+function FileManagerShortcuts:onShowFolderShortcutsDialog(select_callback)
+    self.shortcuts_menu = Menu:new{
+        title = self.title,
+        covers_fullscreen = true,
         is_borderless = true,
-        curr_path = self.ui.file_chooser and self.ui.file_chooser.path or self.ui:getLastDirFile(),
-        onMenuHold = self.onMenuHold,
+        is_popout = false,
+        select_callback = select_callback, -- called from PathChooser titlebar left button
+        title_bar_left_icon = not select_callback and "plus" or nil,
+        onLeftButtonTap = function() self:addShortcut() end,
+        onMenuChoice = self.onMenuChoice,
+        onMenuHold = not select_callback and self.onMenuHold or nil,
         _manager = self,
+        _recreate_func = function() self:onShowFolderShortcutsDialog(select_callback) end,
     }
+    self.shortcuts_menu.close_callback = function()
+        UIManager:close(self.shortcuts_menu)
+        if self.fm_updated then
+            if self.ui.file_chooser then
+                self.ui.file_chooser:refreshPath()
+                self.ui:updateTitleBarPath()
+            end
+            self.fm_updated = nil
+        end
+        self.shortcuts_menu = nil
+    end
     self:updateItemTable()
-    UIManager:show(self.fm_bookmark)
+    UIManager:show(self.shortcuts_menu)
 end
 
 return FileManagerShortcuts

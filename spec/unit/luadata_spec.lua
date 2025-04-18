@@ -1,8 +1,10 @@
 describe("luadata module", function()
-    local Settings
+    local DataStorage, Settings, lfs
     setup(function()
         require("commonrequire")
-        Settings = require("frontend/luadata"):open("this-is-not-a-valid-file")
+        DataStorage = require("datastorage")
+        lfs = require("libs/libkoreader-lfs")
+        Settings = require("luadata"):open(DataStorage:getDataDir() .. "/this-is-not-a-valid-file")
     end)
 
     it("should handle undefined keys", function()
@@ -45,7 +47,7 @@ describe("luadata module", function()
 
         Settings:saveSetting("key", {
             a = "b",
-            c = "true",
+            c = "True",
             d = false,
         })
 
@@ -55,7 +57,7 @@ describe("luadata module", function()
         assert.True(child:has("a"))
         assert.are.equal(child:readSetting("a"), "b")
         assert.True(child:has("c"))
-        assert.True(child:isTrue("c"))
+        assert.False(child:isTrue("c")) -- It's a string, not a bool!
         assert.True(child:has("d"))
         assert.True(child:isFalse("d"))
         assert.False(child:isTrue("e"))
@@ -67,7 +69,10 @@ describe("luadata module", function()
     end)
 
     describe("table wrapper", function()
-        Settings:delSetting("key")
+
+        setup(function()
+            Settings:delSetting("key")
+        end)
 
         it("should add item to table", function()
             Settings:addTableItem("key", 1)
@@ -88,8 +93,11 @@ describe("luadata module", function()
     end)
 
     describe("backup data file", function()
-        local file = "dummy-test-file"
-        local d = Settings:open(file)
+        local file, d
+        setup(function()
+            file = DataStorage:getDataDir() .. "/dummy-test-file"
+            d = Settings:open(file)
+        end)
         it("should generate data file", function()
             d:saveSetting("a", "a")
             assert.Equals("file", lfs.attributes(d.file, "mode"))

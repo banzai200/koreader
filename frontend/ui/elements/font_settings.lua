@@ -3,56 +3,42 @@ local logger = require("logger")
 local util = require("util")
 local _ = require("gettext")
 
---[[ Font settings for desktop linux, mac and android ]]--
+--[[ Font settings for systems with multiple font dirs ]]--
 
-local ANDROID_SYSTEM_FONT_DIR = "/system/fonts"
-local LINUX_SYSTEM_FONT_DIR = "/usr/share/fonts"
-local DESKTOP_USER_FONT_DIR = "/.local/share/fonts"
+local function getDir(isUser)
+    local home = Device.home_dir
 
--- get primary storage on Android
-local function getAndroidPrimaryStorage()
-    local A, android = pcall(require, "android")
-    if not A then return end
-    local path = android.getExternalStoragePath()
-    if path ~= "Unknown" then
-        -- use the external storage identified by the app
-        return path
-    else
-        -- unable to identify external storage. Use defaults
-        return "/sdcard"
+    local XDG_DATA_HOME = os.getenv("XDG_DATA_HOME")
+    local LINUX_FONT_PATH = XDG_DATA_HOME and XDG_DATA_HOME .. "/fonts"
+                                           or home .. "/.local/share/fonts"
+    local LINUX_SYS_FONT_PATH = "/usr/share/fonts"
+    local MACOS_FONT_PATH = "Library/fonts"
+
+    if isUser and not home then return end
+
+    if Device:isAndroid() then
+        return isUser and home .. "/fonts;" .. home .. "/koreader/fonts"
+                       or "/system/fonts"
+    elseif Device:isPocketBook() then
+        return isUser and "/mnt/ext1/system/fonts"
+                       or "/ebrmain/adobefonts;/ebrmain/fonts"
+    elseif Device:isRemarkable() then
+        return isUser and LINUX_FONT_PATH
+                       or LINUX_SYS_FONT_PATH
+    elseif Device:isDesktop() or Device:isEmulator() then
+        if jit.os == "OSX" then
+            return isUser and home .. "/" .. MACOS_FONT_PATH
+                           or "/" .. MACOS_FONT_PATH
+        else
+            return isUser and LINUX_FONT_PATH
+                           or LINUX_SYS_FONT_PATH
+        end
     end
-end
-
--- user font path, should be rw. On linux/mac it goes under $HOME.
--- on Android it goes in the primary storage (internal/sd)
-local function getUserDir()
-    if Device:isDesktop() or Device:isEmulator() then
-        local home = os.getenv("HOME")
-        if home then return home..DESKTOP_USER_FONT_DIR end
-    elseif Device:isAndroid() then
-        local p = getAndroidPrimaryStorage()
-        return p.."/koreader/fonts;"..p.."/fonts"
-    end
-end
-
--- system (ttf) fonts are available on linux and android but not on mac
-local function getSystemDir()
-    if Device:isDesktop() or Device:isEmulator() then
-        if util.pathExists(LINUX_SYSTEM_FONT_DIR) then
-            return LINUX_SYSTEM_FONT_DIR
-        else return nil end
-    elseif Device:isAndroid() then
-        return ANDROID_SYSTEM_FONT_DIR
-    end
-end
-
-local function usesSystemFonts()
-    return G_reader_settings:isTrue("system_fonts")
 end
 
 local function openFontDir()
     if not Device:canOpenLink() then return end
-    local user_dir = getUserDir()
+    local user_dir = getDir(true)
     local openable = util.pathExists(user_dir)
     if not openable and user_dir then
         logger.info("Font path not found, making one in ", user_dir)
@@ -65,29 +51,32 @@ local function openFontDir()
     Device:openLink(user_dir)
 end
 
+local function usesSystemFonts()
+    return G_reader_settings:isTrue("system_fonts")
+end
+
 local FontSettings = {}
 
 function FontSettings:getPath()
+    local user, system = getDir(true), getDir()
     if usesSystemFonts() then
-        local system_path = getSystemDir()
-        if system_path ~= nil then
-            return getUserDir()..";"..system_path
+        if user and system then
+            return user .. ";" .. system
+        elseif system then
+            return system
         end
     end
-    return getUserDir()
+    return user
 end
 
-function FontSettings:getMenuTable()
+function FontSettings:getSystemFontMenuItems()
     local t = {{
         text = _("Enable system fonts"),
         checked_func = usesSystemFonts,
         callback = function()
             G_reader_settings:saveSetting("system_fonts", not usesSystemFonts())
             local UIManager = require("ui/uimanager")
-            local InfoMessage = require("ui/widget/infomessage")
-            UIManager:show(InfoMessage:new{
-                text = _("This will take effect on next restart.")
-            })
+            UIManager:askForRestart()
         end,
     }}
 
@@ -98,11 +87,7 @@ function FontSettings:getMenuTable()
         })
     end
 
-    return {
-        text = _("Font settings"),
-        separator = true,
-        sub_item_table = t
-    }
+    return t
 end
 
 return FontSettings

@@ -1,8 +1,14 @@
 local EventListener = require("ui/widget/eventlistener")
 
-local ReaderHinting = EventListener:new{
-    hinting_states = {}
+local DHINTCOUNT = G_defaults:readSetting("DHINTCOUNT")
+
+local ReaderHinting = EventListener:extend{
+    hinting_states = nil, -- array
 }
+
+function ReaderHinting:init()
+    self.hinting_states = {}
+end
 
 function ReaderHinting:onHintPage()
     if not self.view.hinting then return true end
@@ -12,8 +18,7 @@ function ReaderHinting:onHintPage()
                 self.view.state.page + i,
                 self.zoom:getZoom(self.view.state.page + i),
                 self.view.state.rotation,
-                self.view.state.gamma,
-                self.view.render_mode)
+                self.view.state.gamma)
         end
     end
     return true

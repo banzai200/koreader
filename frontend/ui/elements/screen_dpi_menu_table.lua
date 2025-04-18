@@ -3,28 +3,27 @@ local Device = require("device")
 local Screen = Device.screen
 local T = require("ffi/util").template
 
-local function isAutoDPI() return Device.screen_dpi_override == nil end
+local function isAutoDPI() return Screen.dpi_override == nil end
 
 local function dpi() return Screen:getDPI() end
 
 local function custom() return G_reader_settings:readSetting("custom_screen_dpi") end
 
-local function setDPI(_dpi)
-    local InfoMessage = require("ui/widget/infomessage")
+local function setDPI(dpi_val)
     local UIManager = require("ui/uimanager")
-    UIManager:show(InfoMessage:new{
-        text = _dpi and T(_("DPI set to %1. This will take effect after restarting."), _dpi)
-               or _("DPI set to auto. This will take effect after restarting."),
-    })
-    G_reader_settings:saveSetting("screen_dpi", _dpi)
-    Device:setScreenDPI(_dpi)
+    local text = dpi_val and T(_("DPI set to %1. This will take effect after restarting."), dpi_val)
+               or _("DPI set to auto. This will take effect after restarting.")
+    -- If this is set to nil, reader.lua doesn't call setScreenDPI
+    G_reader_settings:saveSetting("screen_dpi", dpi_val)
+    -- Passing a nil properly resets to defaults/auto
+    Device:setScreenDPI(dpi_val)
+    UIManager:askForRestart(text)
 end
 
 local function spinWidgetSetDPI(touchmenu_instance)
     local SpinWidget = require("ui/widget/spinwidget")
     local UIManager = require("ui/uimanager")
     local items = SpinWidget:new{
-        width = Screen:getWidth() * 0.6,
         value = custom() or dpi(),
         value_min = 90,
         value_max = 900,

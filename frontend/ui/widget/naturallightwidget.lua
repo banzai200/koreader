@@ -7,13 +7,10 @@ local FrameContainer = require("ui/widget/container/framecontainer")
 local Geom = require("ui/geometry")
 local HorizontalGroup = require("ui/widget/horizontalgroup")
 local HorizontalSpan = require("ui/widget/horizontalspan")
-local InputContainer = require("ui/widget/container/inputcontainer")
 local InputText = require("ui/widget/inputtext")
-local LineWidget = require("ui/widget/linewidget")
-local OverlapGroup = require("ui/widget/overlapgroup")
 local Size = require("ui/size")
 local TextBoxWidget = require("ui/widget/textboxwidget")
-local TextWidget = require("ui/widget/textwidget")
+local TitleBar = require("ui/widget/titlebar")
 local UIManager = require("ui/uimanager")
 local VerticalGroup = require("ui/widget/verticalgroup")
 local VerticalSpan = require("ui/widget/verticalspan")
@@ -21,9 +18,8 @@ local WidgetContainer = require("ui/widget/container/widgetcontainer")
 local _ = require("gettext")
 local Screen = Device.screen
 
-local NaturalLightWidget = InputContainer:new{
+local NaturalLightWidget = WidgetContainer:extend{
     is_always_active = true,
-    title_face = Font:getFace("x_smalltfont"),
     width = nil,
     height = nil,
     textbox_width = 0.1,
@@ -46,12 +42,12 @@ function NaturalLightWidget:init()
     self.screen_width = Screen:getWidth()
     self.screen_height = Screen:getHeight()
     self.span = math.ceil(self.screen_height * 0.01)
-    self.width = self.screen_width*0.95
+    self.width = math.floor(self.screen_width * 0.95)
     self.button_width = 0.08 * self.width
     self.textbox_width = 0.1 * self.width
     self.text_width = 0.2 * self.width
     self.powerd = Device:getPowerDevice()
-    self:createFrame()
+    self:update()
 end
 
 function NaturalLightWidget:applyValues()
@@ -100,7 +96,7 @@ function NaturalLightWidget:adaptableNumber(initial, step)
         end,
     }
     local button_plus = Button:new{
-        text = "+",
+        text = "＋",
         margin = Size.margin.small,
         radius = 0,
         width = self.button_width,
@@ -119,6 +115,13 @@ function NaturalLightWidget:adaptableNumber(initial, step)
     table.insert(minus_number_plus, button_minus)
     table.insert(minus_number_plus, input_text)
     table.insert(minus_number_plus, button_plus)
+
+    -- Sanitize the returned value so as not to upset sysfs_light...
+    function input_text:getText()
+        -- Also, while we're here, make sure we actually return a number, because InputText doesn't for... reasons.
+        return tonumber(self.text) or initial
+    end
+
     return minus_number_plus
 end
 
@@ -140,37 +143,24 @@ function NaturalLightWidget:getCurrentValues()
                 self.powerd.fl.exponent}
 end
 
-function NaturalLightWidget:createFrame()
-    self.nl_title = FrameContainer:new{
-        padding = Size.padding.default,
-        margin = Size.margin.title,
-        bordersize = 0,
-        TextWidget:new{
-            text = _("Natural light configuration"),
-            face = self.title_face,
-            bold = true,
-            width = self.screen_width * 0.95,
-        },
+function NaturalLightWidget:update()
+    local title_bar = TitleBar:new{
+        title = _("Natural light configuration"),
+        width = self.width,
+        align = "left",
+        with_bottom_line = true,
+        bottom_v_padding = 0,
+        close_callback = function()
+            self:setAllValues(self.old_values)
+            self:onClose()
+        end,
+        show_parent = self,
     }
     local main_content = FrameContainer:new{
         padding = Size.padding.button,
         margin = Size.margin.small,
         bordersize = 0,
-        self:createMainContent(self.screen_width * 0.95,
-                               self.screen_height * 0.201)
-    }
-    local nl_line = LineWidget:new{
-        dimen = Geom:new{
-            w = self.width,
-            h = Size.line.thick,
-        }
-    }
-    self.nl_bar = OverlapGroup:new{
-        dimen = {
-            w = self.width,
-            h = self.nl_title:getSize().h
-        },
-        self.nl_title,
+        self:createMainContent(self.width, math.floor(self.screen_height * 0.2))
     }
     self.nl_frame = FrameContainer:new{
         radius = Size.radius.window,
@@ -180,11 +170,10 @@ function NaturalLightWidget:createFrame()
         background = Blitbuffer.COLOR_WHITE,
         VerticalGroup:new{
             align = "left",
-            self.nl_bar,
-            nl_line,
+            title_bar,
             CenterContainer:new{
                 dimen = Geom:new{
-                    w = nl_line:getSize().w,
+                    w = self.width,
                     h = main_content:getSize().h,
                 },
                 main_content,
@@ -193,7 +182,7 @@ function NaturalLightWidget:createFrame()
     }
     self[1] = WidgetContainer:new{
         align = "top",
-        dimen =Geom:new{
+        dimen = Geom:new{
             x = 0, y = 0,
             w = self.screen_width,
             h = self.screen_height,
@@ -201,7 +190,7 @@ function NaturalLightWidget:createFrame()
         FrameContainer:new{
             bordersize = 0,
             self.nl_frame,
-        }
+        },
     }
 end
 
@@ -230,49 +219,43 @@ function NaturalLightWidget:createMainContent(width, height)
         text = _("Amplification"),
         face = self.medium_font_face,
         bold = true,
-        alignment = "left",
         width = self.textbox_width + 2 * self.button_width
     }
     local text_offset = TextBoxWidget:new{
         text = _("Offset"),
         face = self.medium_font_face,
         bold = true,
-        alignment = "left",
         width = self.textbox_width + self.button_width
     }
     local text_white = TextBoxWidget:new{
         text = _("White"),
         face = self.medium_font_face,
         bold = true,
-        alignment = "left",
         width = self.text_width
     }
     local text_red = TextBoxWidget:new{
         text = _("Red"),
         face = self.medium_font_face,
         bold = true,
-        alignment = "left",
         width = self.text_width
     }
     local text_green = TextBoxWidget:new{
         text = _("Green"),
         face = self.medium_font_face,
         bold = true,
-        alignment = "left",
         width = self.text_width
     }
     local text_exponent = TextBoxWidget:new{
         text = _("Exponent"),
         face = self.medium_font_face,
         bold = true,
-        alignment = "left",
         width = self.text_width
     }
     local button_defaults = Button:new{
         text = "Restore Defaults",
         margin = Size.margin.small,
         radius = 0,
-        width = self.width * 0.35,
+        width = math.floor(self.width * 0.35),
         show_parent = self,
         callback = function()
             self:setAllValues({white_gain = 25,
@@ -288,7 +271,7 @@ function NaturalLightWidget:createMainContent(width, height)
         text = "Cancel",
         margin = Size.margin.small,
         radius = 0,
-        width = self.width * 0.2,
+        width = math.floor(self.width * 0.2),
         show_parent = self,
         callback = function()
             self:setAllValues(self.old_values)
@@ -299,7 +282,7 @@ function NaturalLightWidget:createMainContent(width, height)
         text = "Save",
         margin = Size.margin.small,
         radius = 0,
-        width = self.width * 0.2,
+        width = math.floor(self.width * 0.2),
         show_parent = self,
         callback = function()
             G_reader_settings:saveSetting("natural_light_config",
@@ -353,7 +336,6 @@ function NaturalLightWidget:createMainContent(width, height)
     table.insert(self.fl_container, vertical_group)
     -- Reset container height to what it actually contains
     self.fl_container.dimen.h = vertical_group:getSize().h
-    UIManager:setDirty(self, "ui")
     return self.fl_container
 end
 
@@ -370,26 +352,21 @@ end
 
 function NaturalLightWidget:setValueTextBox(widget, val)
     widget:focus()
-    widget:setText(val)
+    widget:setText(tostring(val))
     widget:unfocus()
 end
 
 function NaturalLightWidget:onCloseWidget()
     self:closeKeyboard()
     UIManager:setDirty(nil, function()
-        return "partial", self.nl_frame.dimen
+        return "flashui", self.nl_frame.dimen
     end)
-    -- Tell frontlight widget that we're closed
-    self.fl_widget:naturalLightConfigClose()
-    return true
 end
 
 function NaturalLightWidget:onShow()
     UIManager:setDirty(self, function()
-                           return "ui", self.nl_frame.dimen
+        return "ui", self.nl_frame.dimen
     end)
-    -- Tell the frontlight widget that we're open
-    self.fl_widget:naturalLightConfigOpen()
     -- Store values in case user cancels
     self.old_values = self:getCurrentValues()
     return true

@@ -1,11 +1,20 @@
 #!/bin/sh
 export LC_ALL="en_US.UTF-8"
-
 # working directory of koreader
 KOREADER_DIR="${0%/*}"
 
 # we're always starting from our working directory
 cd "${KOREADER_DIR}" || exit
+
+# reMarkable 2 check
+IFS= read -r MACHINE_TYPE <"/sys/devices/soc0/machine"
+if [ "reMarkable 2.0" = "${MACHINE_TYPE}" ]; then
+    if [ -z "${RM2FB_SHIM}" ]; then
+        echo "reMarkable 2 requires RM2FB to work, visit https://github.com/ddvk/remarkable2-framebuffer for instructions how to setup"
+        exit 1
+    fi
+    export KO_DONT_GRAB_INPUT=1
+fi
 
 # update to new version from OTA directory
 ko_update_check() {
@@ -13,7 +22,7 @@ ko_update_check() {
     INSTALLED="${KOREADER_DIR}/ota/koreader.installed.tar"
     if [ -f "${NEWUPDATE}" ]; then
         # If button-listen service is running then stop it during update so that
-        # the update can overwite the binary
+        # the update can overwrite the binary
         systemctl is-active --quiet button-listen
         USING_BUTTON_LISTEN=$?
         if [ ${USING_BUTTON_LISTEN} -eq 0 ]; then
@@ -21,14 +30,19 @@ ko_update_check() {
         fi
 
         ./fbink -q -y -7 -pmh "Updating KOReader"
+        # Setup the FBInk daemon
+        export FBINK_NAMED_PIPE="/tmp/koreader.fbink"
+        rm -f "${FBINK_NAMED_PIPE}"
+        FBINK_PID="$(./fbink --daemon 1 %KOREADER% -q -y -6 -P 0)"
         # NOTE: See frontend/ui/otamanager.lua for a few more details on how we squeeze a percentage out of tar's checkpoint feature
         # NOTE: %B should always be 512 in our case, so let stat do part of the maths for us instead of using %s ;).
         FILESIZE="$(stat -c %b "${NEWUPDATE}")"
         BLOCKS="$((FILESIZE / 20))"
         export CPOINTS="$((BLOCKS / 100))"
         # shellcheck disable=SC2016
-        ./tar xf "${NEWUPDATE}" --strip-components=1 --no-same-permissions --no-same-owner --checkpoint="${CPOINTS}" --checkpoint-action=exec='./fbink -q -y -6 -P $(($TAR_CHECKPOINT/$CPOINTS))'
+        ./tar xf "${NEWUPDATE}" --strip-components=1 --no-same-permissions --no-same-owner --checkpoint="${CPOINTS}" --checkpoint-action=exec='printf "%s" $((TAR_CHECKPOINT / CPOINTS)) > ${FBINK_NAMED_PIPE}'
         fail=$?
+        kill -TERM "${FBINK_PID}"
         # Cleanup behind us...
         if [ "${fail}" -eq 0 ]; then
             mv "${NEWUPDATE}" "${INSTALLED}"
@@ -39,10 +53,11 @@ ko_update_check() {
             ./fbink -q -y -6 -pmh "Update failed :("
             ./fbink -q -y -5 -pm "KOReader may fail to function properly!"
         fi
-        rm -f "${NEWUPDATE}" # always purge newupdate in all cases to prevent update loop
-        unset BLOCKS CPOINTS
+        rm -f "${NEWUPDATE}" # always purge newupdate to prevent update loops
+        unset CPOINTS FBINK_NAMED_PIPE
+        unset BLOCKS FILESIZE FBINK_PID
         # Ensure everything is flushed to disk before we restart. This *will* stall for a while on slow storage!
-        sync
+        busybox sync
 
         if [ ${USING_BUTTON_LISTEN} -eq 0 ]; then
             systemctl start button-listen
@@ -57,17 +72,8 @@ if [ -n "${fail}" ] && [ "${fail}" -eq 0 ]; then
     exec ./koreader.sh "${@}"
 fi
 
-# load our own shared libraries if possible
-export LD_LIBRARY_PATH="${KOREADER_DIR}/libs:${LD_LIBRARY_PATH}"
-
-# export trained OCR data directory
-export TESSDATA_PREFIX="data"
-
 # export dict directory
 export STARDICT_DATA_DIR="data/dict"
-
-# export external font directory
-export EXT_FONT_DIR="/usr/share/fonts/ttf;/usr/share/fonts/opentype"
 
 # We'll want to ensure Portrait rotation to allow us to use faster blitting codepaths @ 8bpp,
 # so remember the current one before fbdepth does its thing.
@@ -96,6 +102,10 @@ esac
 
 # The actual swap is done in a function, because we can disable it in the Developer settings, and we want to honor it on restart.
 ko_do_fbdepth() {
+    if [ -n "${KO_DONT_SET_DEPTH}" ]; then
+        return
+    fi
+
     # Check if the swap has been disabled...
     if grep -q '\["dev_startup_no_fbdepth"\] = true' 'settings.reader.lua' 2>/dev/null; then
         # Swap back to the original bitdepth (in case this was a restart)
@@ -108,7 +118,7 @@ ko_do_fbdepth() {
         # Swap to 8bpp if things look sane
         if [ -n "${ORIG_FB_BPP}" ]; then
             echo "Switching fb bitdepth to 8bpp & rotation to Portrait" >>crash.log 2>&1
-            ./fbdepth -d 8 -r -1 >>crash.log 2>&1
+            ./fbdepth -d 8 -r 1 >>crash.log 2>&1
         fi
     fi
 }
@@ -117,12 +127,6 @@ ko_do_fbdepth() {
 if [ -e crash.log ]; then
     tail -c 500000 crash.log >crash.log.new
     mv -f crash.log.new crash.log
-fi
-
-if [ "$#" -eq 0 ]; then
-    args="/home/root"
-else
-    args="$*"
 fi
 
 CRASH_COUNT=0
@@ -139,7 +143,7 @@ while [ ${RETURN_VALUE} -ne 0 ]; do
         ko_do_fbdepth
     fi
 
-    ./reader.lua "${args}" >>crash.log 2>&1
+    ./reader.lua "$@" >>crash.log 2>&1
     RETURN_VALUE=$?
 
     # Did we crash?
@@ -173,16 +177,16 @@ while [ ${RETURN_VALUE} -ne 0 ]; do
         # With a little notice at the top of the screen, on a big gray screen of death ;).
         ./fbink -q -b -c -B GRAY9 -m -y 1 "Don't Panic! (Crash n°${CRASH_COUNT} -> ${RETURN_VALUE})"
         if [ ${CRASH_COUNT} -eq 1 ]; then
-            # Warn that we're waiting on a tap to continue...
-            ./fbink -q -b -O -m -y 2 "Tap the screen to continue."
+            # Warn that we're sleeping for a bit...
+            ./fbink -q -b -O -m -y 2 "KOReader will restart in 15 sec."
         fi
         # U+1F4A3, the hard way, because we can't use \u or \U escape sequences...
-        # shellcheck disable=SC2039
-        ./fbink -q -b -O -m -t regular=./fonts/freefont/FreeSerif.ttf,px=${bombHeight},top=${bombMargin} $'\xf0\x9f\x92\xa3'
+        # shellcheck disable=SC2039,SC3003
+        ./fbink -q -b -O -m -t regular=./fonts/freefont/FreeSerif.ttf,px=${bombHeight},top=${bombMargin} -- $'\xf0\x9f\x92\xa3'
         # And then print the tail end of the log on the bottom of the screen...
         crashLog="$(tail -n 25 crash.log | sed -e 's/\t/    /g')"
         # The idea for the margins being to leave enough room for an fbink -Z bar, small horizontal margins, and a font size based on what 6pt looked like @ 265dpi
-        ./fbink -q -b -O -t regular=./fonts/droid/DroidSansMono.ttf,top=$((viewHeight / 2 + FONTH * 2 + FONTH / 2)),left=$((viewWidth / 60)),right=$((viewWidth / 60)),px=$((viewHeight / 64)) "${crashLog}"
+        ./fbink -q -b -O -t regular=./fonts/droid/DroidSansMono.ttf,top=$((viewHeight / 2 + FONTH * 2 + FONTH / 2)),left=$((viewWidth / 60)),right=$((viewWidth / 60)),px=$((viewHeight / 64)) -- "${crashLog}"
         # So far, we hadn't triggered an actual screen refresh, do that now, to make sure everything is bundled in a single flashing refresh.
         ./fbink -q -f -s
         # Cue a lemming's faceplant sound effect!
@@ -199,10 +203,7 @@ while [ ${RETURN_VALUE} -ne 0 ]; do
 
         # Pause a bit if it's the first crash in a while, so that it actually has a chance of getting noticed ;).
         if [ ${CRASH_COUNT} -eq 1 ]; then
-            # NOTE: We don't actually care about what read read, we're just using it as a fancy sleep ;).
-            #       i.e., we pause either until the 15s timeout, or until the user touches the screen.
-            # shellcheck disable=SC2039
-            read -r -t 15 </dev/input/event1
+            sleep 15
         fi
         # Cycle the last crash timestamp
         CRASH_PREV_TS=${CRASH_TS}

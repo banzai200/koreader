@@ -1,49 +1,57 @@
 local BD = require("ui/bidi")
-local ButtonDialogTitle = require("ui/widget/buttondialogtitle")
+local ButtonDialog = require("ui/widget/buttondialog")
+local Device = require("device")
 local FileChooser = require("ui/widget/filechooser")
-local Font = require("ui/font")
 local UIManager = require("ui/uimanager")
-local ffiutil = require("ffi/util")
+local ffiUtil = require("ffi/util")
 local lfs = require("libs/libkoreader-lfs")
 local util = require("util")
 local _ = require("gettext")
-local T = ffiutil.template
+local N_ = _.ngettext
+local T = ffiUtil.template
 
 local PathChooser = FileChooser:extend{
     title = true, -- or a string
         -- if let to true, a generic title will be set in init()
     no_title = false,
-    show_path = true,
-    is_popout = false,
-    covers_fullscreen = true, -- set it to false if you set is_popout = true
-    is_borderless = true,
-    -- smaller font to allow displaying our long titles
-    tface = Font:getFace("smalltfont"),
-
     select_directory = true, -- allow selecting directories
     select_file = true,      -- allow selecting files
-    show_files = true, -- show files, even if select_files=false
+    show_files = true, -- show files, even if select_file=false
     -- (directories are always shown, to allow navigation)
-    detailed_file_info = false, -- show size and last mod time in Select message
+    detailed_file_info = true, -- show size and last mod time in Select message (if select_file=true only)
 }
 
 function PathChooser:init()
+    local collate = G_reader_settings:readSetting("collate")
+    if self.show_files and (collate == "title" or collate == "authors" or collate == "series" or collate == "keywords") then
+        self.ui = require("apps/reader/readerui").instance or require("apps/filemanager/filemanager").instance
+    end
+
     if self.title == true then -- default title depending on options
         if self.select_directory and not self.select_file then
-            self.title = _("Long-press to select directory")
+            self.title = _("Long-press folder's name to choose it")
         elseif not self.select_directory and self.select_file then
-            self.title = _("Long-press to select file")
+            self.title = _("Long-press file's name to choose it")
         else
-            self.title = _("Long-press to select")
+            self.title = _("Long-press item's name to choose it")
         end
     end
-    self.show_hidden = G_reader_settings:readSetting("show_hidden")
     if not self.show_files then
         self.file_filter = function() return false end -- filter out regular files
     end
+    if self.file_filter then
+        self.show_unsupported = false -- honour file_filter
+    end
     if self.select_directory then
-        -- Let FileChooser display "Long press to select current directory"
+        -- Let FileChooser display "Long-press to choose current folder"
         self.show_current_dir_for_hold = true
+    end
+    self.title_bar_left_icon = "home"
+    self.onLeftButtonTap = function()
+        self:goHome()
+    end
+    self.onLeftButtonHold = function()
+        self:showPlusMenu()
     end
     FileChooser.init(self)
 end
@@ -51,10 +59,13 @@ end
 function PathChooser:onMenuSelect(item)
     local path = item.path
     if path:sub(-2, -1) == "/." then -- with show_current_dir_for_hold
+        if not Device:isTouchDevice() and self.select_directory then -- let non-touch device can select the folder
+            return self:onMenuHold(item)
+        end
         -- Don't navigate to same directory
         return true
     end
-    path = ffiutil.realpath(path)
+    path = ffiUtil.realpath(path)
     if not path then
         -- If starting in a no-more existing directory, allow
         -- not getting stuck in it
@@ -68,6 +79,9 @@ function PathChooser:onMenuSelect(item)
         return true
     end
     if attr.mode ~= "directory" then
+        if not Device:isTouchDevice() and self.select_file then -- let non-touch device can select the file
+            return self:onMenuHold(item)
+        end
         -- Do nothing if Tap on other than directories
         return true
     end
@@ -85,7 +99,7 @@ function PathChooser:onMenuHold(item)
     if path:sub(-2, -1) == "/." then -- with show_current_dir_for_hold
         path = path:sub(1, -3)
     end
-    path = ffiutil.realpath(path)
+    path = ffiUtil.realpath(path)
     if not path then
         return true
     end
@@ -101,21 +115,20 @@ function PathChooser:onMenuHold(item)
     end
     local title
     if attr.mode == "file" then
+        title = _("Choose this file?") .. "\n\n" .. BD.filepath(path) .. "\n"
         if self.detailed_file_info then
             local filesize = util.getFormattedSize(attr.size)
             local lastmod = os.date("%Y-%m-%d %H:%M", attr.modification)
-            title = T(_("Select this file?\n\n%1\n\nFile size: %2 bytes\nLast modified: %3"),
-                        BD.filepath(path), filesize, lastmod)
-        else
-            title = T(_("Select this file?\n\n%1"), BD.filepath(path))
+            title = title .. "\n" .. T(N_("File size: 1 byte", "File size: %1 bytes", attr.size), filesize) ..
+                             "\n" .. T(_("Last modified: %1"), lastmod) .. "\n"
         end
     elseif attr.mode == "directory" then
-        title = T(_("Select this directory?\n\n%1"), BD.dirpath(path))
+        title = _("Choose this folder?") .. "\n\n" .. BD.dirpath(path) .. "\n"
     else -- just in case we get something else
-        title = T(_("Select this path?\n\n%1"), BD.path(path))
+        title = _("Choose this path?") .. "\n\n" .. BD.path(path) .. "\n"
     end
     local onConfirm = self.onConfirm
-    self.button_dialog = ButtonDialogTitle:new{
+    self.button_dialog = ButtonDialog:new{
         title = title,
         buttons = {
             {
@@ -126,7 +139,7 @@ function PathChooser:onMenuHold(item)
                     end,
                 },
                 {
-                    text = _("Select"),
+                    text = _("Choose"),
                     callback = function()
                         if onConfirm then
                             onConfirm(path)
@@ -140,6 +153,39 @@ function PathChooser:onMenuHold(item)
     }
     UIManager:show(self.button_dialog)
     return true
+end
+
+function PathChooser:showPlusMenu()
+    local button_dialog
+    button_dialog = ButtonDialog:new{
+        buttons = {
+            {
+                {
+                    text = _("Folder shortcuts"),
+                    callback = function()
+                        UIManager:close(button_dialog)
+                        local FileManagerShortcuts = require("apps/filemanager/filemanagershortcuts")
+                        local select_callback = function(path)
+                            self:changeToPath(path)
+                        end
+                        FileManagerShortcuts:onShowFolderShortcutsDialog(select_callback)
+                    end,
+                },
+            },
+            {
+                {
+                    text = _("New folder"),
+                    callback = function()
+                        UIManager:close(button_dialog)
+                        local FileManager = require("apps/filemanager/filemanager")
+                        FileManager.file_chooser = self
+                        FileManager:createFolder()
+                    end,
+                },
+            },
+        },
+    }
+    UIManager:show(button_dialog)
 end
 
 return PathChooser

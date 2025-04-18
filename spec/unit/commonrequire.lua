@@ -1,27 +1,21 @@
--- don't try to overwrite metatables so we can use --auto-insulate-tests
--- shamelessly copied from https://github.com/Olivine-Labs/busted/commit/db6d8b4be8fd099ab387efeb8232cfd905912abb
-local ffi = require "ffi"
-local old_metatype = ffi.metatype
-local exists = {}
-ffi.metatype = function(def, mttable)
-    if exists[def] then return exists[def] end
-    exists[def] = old_metatype(def, mttable)
-    return exists[def]
-end
-
-require "defaults"
-package.path = "?.lua;common/?.lua;rocks/share/lua/5.1/?.lua;frontend/?.lua;" .. package.path
-package.cpath = "?.so;common/?.so;/usr/lib/lua/?.so;rocks/lib/lua/5.1/?.so;" .. package.cpath
-
 -- turn off debug by default and set log level to warning
 require("dbg"):turnOff()
 local logger = require("logger")
 logger:setLevel(logger.levels.warn)
 
--- global reader settings
 local DataStorage = require("datastorage")
-os.remove(DataStorage:getDataDir().."/settings.reader.lua")
-G_reader_settings = require("luasettings"):open(".reader")
+require("libs/libkoreader-lfs").mkdir(DataStorage:getHistoryDir()) -- for legacy history tests
+
+-- global defaults
+os.remove(DataStorage:getDataDir() .. "/defaults.tests.lua")
+os.remove(DataStorage:getDataDir() .. "/defaults.tests.lua.old")
+G_defaults = require("luadefaults"):open(DataStorage:getDataDir() .. "/defaults.tests.lua")
+
+-- global reader settings
+os.remove(DataStorage:getDataDir() .. "/settings.tests.lua")
+os.remove(DataStorage:getDataDir() .. "/settings.tests.lua.old")
+G_reader_settings = require("luasettings"):open(DataStorage:getDataDir() .. "/settings.tests.lua")
+G_reader_settings:saveSetting("document_metadata_folder", "dir")
 
 -- global einkfb for Screen (do not show SDL window)
 einkfb = require("ffi/framebuffer") --luacheck: ignore
@@ -60,46 +54,35 @@ package.reload = function(name)
     return require(name)
 end
 
-package.unloadAll = function()
-    local candidates = {
-        "spec/",
-        "frontend/",
-        "plugins/",
-        "datastorage.lua",
-        "defaults.lua",
-    }
-    local pending = {}
-    for name, _ in pairs(package.loaded) do
-        local path = package.searchpath(name, package.path)
-        if path ~= nil then
-            for _, candidate in ipairs(candidates) do
-                if path:find(candidate) == 1 then
-                    table.insert(pending, name)
-                end
-            end
-        end
-    end
-    for _, name in ipairs(pending) do
-        if name ~= "commonrequire" then
-            assert(package.unload(name))
-        end
-    end
-    return #pending
+function disable_plugins()
+    local PluginLoader = require("pluginloader")
+    PluginLoader.enabled_plugins = {}
+    PluginLoader.disabled_plugins = {}
+    PluginLoader.loaded_plugins = {}
 end
 
-local background_runner
-requireBackgroundRunner = function()
-    require("pluginshare").stopBackgroundRunner = nil
-    if background_runner == nil then
-        local package_path = package.path
-        package.path = "plugins/backgroundrunner.koplugin/?.lua;" .. package.path
-        background_runner = dofile("plugins/backgroundrunner.koplugin/main.lua")
-        package.path = package_path
+function load_plugin(name)
+    local PluginLoader = require("pluginloader")
+    local t = PluginLoader:_discover()
+    for _, v in ipairs(t) do
+        if v.name == name then
+            PluginLoader:_load{v}
+            return
+        end
     end
-    return background_runner
+    assert(false)
 end
 
-stopBackgroundRunner = function()
-    background_runner = nil
-    require("pluginshare").stopBackgroundRunner = true
+function fastforward_ui_events()
+    local UIManager = require("ui/uimanager")
+    -- Fast forward all scheduled tasks.
+    UIManager:shiftScheduledTasksBy(-1e9)
+    -- Fix hang when running tests with our docker base image SDL.
+    UIManager:setInputTimeout(0)
+    -- And run the UI manager's input loop once.
+    UIManager:handleInput()
+end
+
+function screenshot(screen, filename)
+    screen:shot(DataStorage:getDataDir() .. "/screenshots/" .. filename)
 end

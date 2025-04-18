@@ -12,8 +12,15 @@ describe("gesturedetector module", function()
                 direction = direction,
                 multiswipe_directions = direction,
             }
-            GestureDetector.screen = {}
-            GestureDetector.screen.cur_rotation_mode = rotation_mode
+            GestureDetector.screen = {
+                                        DEVICE_ROTATED_UPRIGHT = 0,
+                                        DEVICE_ROTATED_CLOCKWISE = 1,
+                                        DEVICE_ROTATED_UPSIDE_DOWN = 2,
+                                        DEVICE_ROTATED_COUNTER_CLOCKWISE = 3,
+                                     }
+            GestureDetector.screen.getTouchRotation = function() return rotation_mode end
+            GestureDetector.screen.getHeight = function() return 800 end
+            GestureDetector.screen.getWidth = function() return 600 end
 
             return GestureDetector:adjustGesCoordinate(ges).direction
         end
@@ -25,7 +32,7 @@ describe("gesturedetector module", function()
             assert.are.equal("north", adjustTest("two_finger_swipe", "north", 0))
             assert.are.equal("north", adjustTest("two_finger_pan", "north", 0))
         end)
-        it("should translate rotation 90", function()
+        it("should translate rotation 270", function()
             assert.are.equal("west", adjustTest("swipe", "north", 3))
             assert.are.equal("west", adjustTest("multiswipe", "north", 3))
             assert.are.equal("west", adjustTest("pan", "north", 3))
@@ -39,7 +46,7 @@ describe("gesturedetector module", function()
             assert.are.equal("south", adjustTest("two_finger_swipe", "north", 2))
             assert.are.equal("south", adjustTest("two_finger_pan", "north", 2))
         end)
-        it("should translate rotation 270", function()
+        it("should translate rotation 90", function()
             assert.are.equal("east", adjustTest("swipe", "north", 1))
             assert.are.equal("east", adjustTest("multiswipe", "north", 1))
             assert.are.equal("east", adjustTest("pan", "north", 1))

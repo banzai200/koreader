@@ -1,6 +1,6 @@
 --[[--
 The EventListener is an interface that handles events. This is the base class
-for @{ui.widget.widget}
+for @{ui.widget.widget|Widget}
 
 EventListeners have a rudimentary event handler/dispatcher that
 will call a method "onEventName" for an event with name
@@ -9,10 +9,15 @@ will call a method "onEventName" for an event with name
 
 local EventListener = {}
 
-function EventListener:new(new_o)
-    local o = new_o or {}
+function EventListener:extend(subclass_prototype)
+    local o = subclass_prototype or {}
     setmetatable(o, self)
     self.__index = self
+    return o
+end
+
+function EventListener:new(o)
+    o = self:extend(o)
     if o.init then o:init() end
     return o
 end
@@ -28,7 +33,8 @@ By default, it's `"on"..Event.name`.
 ]]
 function EventListener:handleEvent(event)
     if self[event.handler] then
-        return self[event.handler](self, unpack(event.args))
+        --print("EventListener:handleEvent:", event.handler, "handled by", debug.getinfo(self[event.handler], "S").short_src, self)
+        return self[event.handler](self, unpack(event.args, 1, event.args.n))
     end
 end
 

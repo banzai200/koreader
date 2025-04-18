@@ -1,10 +1,10 @@
 -- widget test utility
 -- usage: ./luajit tools/wtest.lua
 
-require "defaults"
-print(package.path)
-package.path = "common/?.lua;rocks/share/lua/5.1/?.lua;frontend/?.lua;" .. package.path
-package.cpath = "common/?.so;common/?.dll;/usr/lib/lua/?.so;rocks/lib/lua/5.1/?.so;" .. package.cpath
+require("setupkoenv")
+
+-- Load default settings
+G_defaults = require("luadefaults"):open()
 
 local DataStorage = require("datastorage")
 local _ = require("gettext")
@@ -71,7 +71,7 @@ function TestVisible:paintTo(bb)
     h_line = math.floor(bb:getHeight() / 50)
     -- Paint white background for higher contrast
     bb:paintRect(0,0,bb:getWidth(),bb:getHeight(), Blitbuffer.COLOR_WHITE)
-    -- Only render gridtext not lines at a more central postition, so it doesn't interfere with the
+    -- Only render gridtext not lines at a more central position, so it doesn't interfere with the
     for i=1,h_line do
         y_num = i*50
         RenderText:renderUtf8Text(bb, 40, y_num+10, Font:getFace("ffont", 12), y_num, true)
@@ -129,7 +129,7 @@ Background = InputContainer:new{
     key_events = {
         OpenDialog = { { "Press" } },
         OpenConfirmBox = { { "Del" } },
-        QuitApplication = { { {"Home","Back"} } }
+        QuitApplication = { { { "Home", "Back" } } },
     },
     -- contains a gray rectangular desktop
     FrameContainer:new{
@@ -137,7 +137,8 @@ Background = InputContainer:new{
         bordersize = 0,
         dimen = Screen:getSize(),
         Widget:new{
-            dimen = {
+            dimen = Geom:new{
+                x = 0, y = 0,
                 w = Screen:getWidth(),
                 h = Screen:getHeight(),
             }
@@ -271,7 +272,7 @@ touch_menu = TouchMenu:new{
     width = Screen:getWidth(),
     tab_item_table = {
         {
-            icon = "resources/icons/appbar.pokeball.png",
+            icon = "appbar.pokeball",
             {
                 text = "item1",
                 callback = function() end,
@@ -310,7 +311,7 @@ touch_menu = TouchMenu:new{
             },
         },
         {
-            icon = "resources/icons/appbar.page.corner.bookmark.png",
+            icon = "appbar.page.corner.bookmark",
             {
                 text = "item10",
                 callback = function() end,
@@ -321,7 +322,7 @@ touch_menu = TouchMenu:new{
             },
         },
         {
-            icon = "resources/icons/appbar.home.png",
+            icon = "home",
             callback = function() DEBUG("hello world!") end
         }
     },
@@ -386,11 +387,8 @@ function testBookStatus()
         document = doc
     }
 
-    local status_page = require("ui/widget/bookstatuswidget"):new {
-        thumbnail = doc:getCoverPageImage(),
-        props = doc:getProps(),
-        document = doc,
-        view = reader.view,
+    local status_page = require("ui/widget/bookstatuswidget"):new{
+        ui = reader,
     }
     UIManager:show(status_page)
 end

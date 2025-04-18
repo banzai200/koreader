@@ -30,7 +30,7 @@ local PerceptionExpander = Widget:extend{
 function PerceptionExpander:init()
     if not self.settings then self:readSettingsFile() end
 
-    self.is_enabled = self.settings:readSetting("is_enabled") or false
+    self.is_enabled = self.settings:isTrue("is_enabled")
     if not self.is_enabled then
         return
     end
@@ -52,8 +52,8 @@ function PerceptionExpander:createUI(readSettings)
 
     self.screen_width = Screen:getWidth()
     local screen_height = Screen:getHeight()
-    local line_height = screen_height * 0.9
-    local line_top_position = screen_height * 0.05
+    local line_height = math.floor(screen_height * 0.9)
+    local line_top_position = math.floor(screen_height * 0.05)
 
     self.last_screen_mode = Screen:getScreenMode()
     if self.last_screen_mode == "landscape" then
@@ -128,7 +128,7 @@ function PerceptionExpander:showSettingsDialog()
             {
                 text = "",
                 input_type = "number",
-                hint = T(_("Increase margin after pages. Current value: %1"),
+                hint = T(_("Increase margin after pages. Current value: %1\nSet to 0 to disable."),
                     self.shift_each_pages),
             },
         },
@@ -136,6 +136,7 @@ function PerceptionExpander:showSettingsDialog()
             {
                 {
                     text = _("Cancel"),
+                    id = "close",
                     callback = function()
                         self.settings_dialog:onClose()
                         UIManager:close(self.settings_dialog)
@@ -144,7 +145,7 @@ function PerceptionExpander:showSettingsDialog()
                 {
                     text = _("Apply"),
                     callback = function()
-                        self:saveSettings(MultiInputDialog:getFields())
+                        self:saveSettings(self.settings_dialog:getFields())
                         self.settings_dialog:onClose()
                         UIManager:close(self.settings_dialog)
                         self:createUI()
@@ -152,8 +153,6 @@ function PerceptionExpander:showSettingsDialog()
                 },
             },
         },
-        width = Screen:getWidth() * 0.8,
-        height = Screen:getHeight() * 0.3,
     }
     UIManager:show(self.settings_dialog)
     self.settings_dialog:onShowKeyboard()
@@ -203,7 +202,7 @@ function PerceptionExpander:onPageUpdate(pageno)
         self:createUI()
     end
 
-    if self.page_counter >= self.shift_each_pages and self.margin < self.ALMOST_CENTER_OF_THE_SCREEN then
+    if self.shift_each_pages ~= 0 and self.page_counter >= self.shift_each_pages and self.margin < self.ALMOST_CENTER_OF_THE_SCREEN then
         self.page_counter = 0
         self.margin = self.margin + self.margin_shift
         self.left_line.dimen.x = self.screen_width * self.margin
@@ -216,14 +215,14 @@ end
 
 function PerceptionExpander:saveSettings(fields)
     if fields then
-        self.line_thickness = tonumber(fields[1])
-        self.margin = tonumber(fields[2])
+        self.line_thickness = fields[1] ~= "" and tonumber(fields[1]) or self.line_thickness
+        self.margin = fields[2] ~= "" and tonumber(fields[2]) or self.margin
 
-        local line_intensity = tonumber(fields[3])
+        local line_intensity = fields[3] ~= "" and tonumber(fields[3]) or self.line_color_intensity * 10
         if line_intensity then
-            self.line_color_intensity = line_intensity / 10
+            self.line_color_intensity = line_intensity * (1/10)
         end
-        self.shift_each_pages = tonumber(fields[4])
+        self.shift_each_pages = fields[4] ~= "" and tonumber(fields[4]) or self.shift_each_pages
     end
 
     self.settings:saveSetting("line_thick", self.line_thickness)

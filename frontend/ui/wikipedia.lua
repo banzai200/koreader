@@ -2,7 +2,9 @@ local JSON = require("json")
 local RenderImage = require("ui/renderimage")
 local Screen = require("device").screen
 local ffiutil = require("ffi/util")
+local lfs = require("libs/libkoreader-lfs")
 local logger = require("logger")
+local time = require("ui/time")
 local util = require("util")
 local _ = require("gettext")
 local T = ffiutil.template
@@ -29,7 +31,7 @@ local Wikipedia = {
        generator = "search",
        gsrnamespace = "0",
        -- gsrsearch = nil, -- text to lookup, will be added below
-       gsrlimit = 20, -- max nb of results to get
+       gsrlimit = 30, -- max nb of results to get
        exlimit = "max",
        prop = "extracts|info|pageimages", -- 'extracts' to get text, 'info' to get full page length
        format = "json",
@@ -53,10 +55,11 @@ local Wikipedia = {
    wiki_phtml_params = {
        action = "parse",
        format = "json",
-       -- we only need the following informations
+       -- we only need the following pieces of information
        prop = "text|sections|displaytitle|revid",
        -- page = nil, -- text to lookup, will be added below
        -- disabletoc = "", -- if we want to remove toc IN html
+            -- 20230722: there is no longer the TOC in the html no matter this param
        disablelimitreport = "",
        disableeditsection = "",
    },
@@ -65,7 +68,7 @@ local Wikipedia = {
    wiki_images_params = { -- same as previous one, with just text html
        action = "parse",
        format = "json",
-       -- we only need the following informations
+       -- we only need the following pieces of information
        prop = "text",
        -- page = nil, -- text to lookup, will be added below
        redirects = "",
@@ -95,93 +98,50 @@ function Wikipedia:getWikiServer(lang)
     return string.format(self.wiki_server, lang or self.default_lang)
 end
 
--- Say who we are to Wikipedia (see https://meta.wikimedia.org/wiki/User-Agent_policy)
-local USER_AGENT = T("KOReader/%1 (https://koreader.rocks/) %2",
-    (lfs.attributes("git-rev", "mode") == "file" and io.open("git-rev", "r"):read() or "devel"),
-    require('socket.http').USERAGENT:gsub(" ", "/") )
-
--- Codes that getUrlContent may get from requester.request()
-local TIMEOUT_CODE = "timeout" -- from socket.lua
-local MAXTIME_CODE = "maxtime reached" -- from sink_table_with_maxtime
-
--- Sink that stores into a table, aborting if maxtime has elapsed
-local function sink_table_with_maxtime(t, maxtime)
-    -- Start counting as soon as this sink is created
-    local start_secs, start_usecs = ffiutil.gettime()
-    local starttime = start_secs + start_usecs/1000000
-    t = t or {}
-    local f = function(chunk, err)
-        local secs, usecs = ffiutil.gettime()
-        if secs + usecs/1000000 - starttime > maxtime then
-            return nil, MAXTIME_CODE
-        end
-        if chunk then table.insert(t, chunk) end
-        return 1
-    end
-    return f, t
-end
-
 -- Get URL content
 local function getUrlContent(url, timeout, maxtime)
-    local socket = require('socket')
-    local ltn12 = require('ltn12')
-    local http = require('socket.http')
-    local https = require('ssl.https')
+    local http = require("socket.http")
+    local ltn12 = require("ltn12")
+    local socket = require("socket")
+    local socketutil = require("socketutil")
+    local socket_url = require("socket.url")
 
-    local requester
-    if url:sub(1,7) == "http://" then
-        requester = http
-    elseif url:sub(1,8) == "https://" then
-        requester = https
-    else
+    local parsed = socket_url.parse(url)
+    if parsed.scheme ~= "http" and parsed.scheme ~= "https" then
         return false, "Unsupported protocol"
     end
     if not timeout then timeout = 10 end
-    -- timeout needs to be set to 'http', even if we use 'https'
-    http.TIMEOUT, https.TIMEOUT = timeout, timeout
 
-    local request = {}
     local sink = {}
-    request['url'] = url
-    request['method'] = 'GET'
-    request['headers'] = {
-        ["User-Agent"] = USER_AGENT,
+    socketutil:set_timeout(timeout, maxtime or 30)
+    local request = {
+        url     = url,
+        method  = "GET",
+        sink    = maxtime and socketutil.table_sink(sink) or ltn12.sink.table(sink),
     }
-    -- 'timeout' delay works on socket, and is triggered when
-    -- that time has passed trying to connect, or after connection
-    -- when no data has been read for this time.
-    -- On a slow connection, it may not be triggered (as we could read
-    -- 1 byte every 1 second, not triggering any timeout).
-    -- 'maxtime' can be provided to overcome that, and we start counting
-    -- as soon as the first content byte is received (but it is checked
-    -- for only when data is received).
-    -- Setting 'maxtime' and 'timeout' gives more chance to abort the request when
-    -- it takes too much time (in the worst case: in timeout+maxtime seconds).
-    -- But time taken by DNS lookup cannot easily be accounted for, so
-    -- a request may (when dns lookup takes time) exceed timeout and maxtime...
-    if maxtime then
-        request['sink'] = sink_table_with_maxtime(sink, maxtime)
-    else
-        request['sink'] = ltn12.sink.table(sink)
-    end
 
-    local code, headers, status = socket.skip(1, requester.request(request))
+    local code, headers, status = socket.skip(1, http.request(request))
+    socketutil:reset_timeout()
     local content = table.concat(sink) -- empty or content accumulated till now
     -- logger.dbg("code:", code)
     -- logger.dbg("headers:", headers)
     -- logger.dbg("status:", status)
     -- logger.dbg("#content:", #content)
 
-    if code == TIMEOUT_CODE or code == MAXTIME_CODE then
+    if code == socketutil.TIMEOUT_CODE or
+       code == socketutil.SSL_HANDSHAKE_CODE or
+       code == socketutil.SINK_TIMEOUT_CODE
+    then
         logger.warn("request interrupted:", code)
         return false, code
     end
     if headers == nil then
-        logger.warn("No HTTP headers:", code, status)
+        logger.warn("No HTTP headers:", status or code or "network unreachable")
         return false, "Network or remote server unavailable"
     end
-    if not code or string.sub(code, 1, 1) ~= "2" then -- all 200..299 HTTP codes are OK
-        logger.warn("HTTP status not okay:", code, status)
+    if not code or code < 200 or code > 299 then -- all 200..299 HTTP codes are OK
+        logger.warn("HTTP status not okay:", status or code or "network unreachable")
+        logger.dbg("Response headers:", headers)
         return false, "Remote server error or unavailable"
     end
     if headers and headers["content-length"] then
@@ -212,7 +172,7 @@ local WIKIPEDIA_IMAGES = 4
 --  return decoded JSON table from Wikipedia
 --]]
 function Wikipedia:loadPage(text, lang, page_type, plain)
-    local url = require('socket.url')
+    local url = require("socket.url")
     local query = ""
     local parsed = url.parse(self:getWikiServer(lang))
     parsed.path = self.wiki_path
@@ -265,7 +225,7 @@ function Wikipedia:loadPage(text, lang, page_type, plain)
         error(content)
     end
 
-    if content ~= "" and string.sub(content, 1,1) == "{" then
+    if content ~= "" and string.sub(content, 1, 1) == "{" then
         local ok, result = pcall(JSON.decode, content)
         if ok and result then
             logger.dbg("wiki result json:", result)
@@ -348,14 +308,15 @@ function Wikipedia:getFullPageImages(wiki_title, lang)
         local wiki_base_url = self:getWikiServer(lang)
 
         local thumbs = {} -- bits of HTML containing an image
-        -- We first try to catch images in <div class=thumbinner>, which should exclude
-        -- wikipedia icons, flags... These seem to all end with a double </div>.
-        for thtml in html:gmatch([[<div class="thumbinner".-</div>%s*</div>]]) do
+        -- We first try to catch images in <figure>, which should exclude
+        -- wikipedia icons, flags...
+        -- (We want to match both typeof="mw:File/Thumb" and typeof="mw:File/Frame", so this [TF][hr][ua]m[be]...
+        for thtml in html:gmatch([[<figure [^>]*typeof="mw:File/[TF][hr][ua]m[be]"[^>]*>.-</figure>]]) do
             table.insert(thumbs, thtml)
         end
         -- We then also try to catch images in galleries (which often are less
         -- interesting than those in thumbinner) as a 2nd set.
-        for thtml in html:gmatch([[<li class="gallerybox".-<div class="thumb".-</div>%s*</div>%s*<div class="gallerytext">.-</div>%s*</div>]]) do
+        for thtml in html:gmatch([[<li class="gallerybox".-<div class="thumb".-</div>%s*<div class="gallerytext">.-</div>]]) do
             table.insert(thumbs, thtml)
         end
         -- We may miss some interesting images in the page's top right table, but
@@ -364,7 +325,7 @@ function Wikipedia:getFullPageImages(wiki_title, lang)
         for _, thtml in ipairs(thumbs) do
             -- We get <a href="/wiki/File:real_file_name.jpg (or /wiki/Fichier:real_file_name.jpg
             -- depending on Wikipedia lang)
-            local filename = thtml:match([[<a href="/wiki/[^:]*:([^"]*)" class="image"]])
+            local filename = thtml:match([[<a href="/wiki/[^:]*:([^"]*)" class="mw.file.description"]])
             if filename then
                 filename = url.unescape(filename)
             end
@@ -386,7 +347,7 @@ function Wikipedia:getFullPageImages(wiki_title, lang)
                     end
                     local width = tonumber(timg:match([[width="([^"]*)"]]))
                     local height = tonumber(timg:match([[height="([^"]*)"]]))
-                    -- Ignore img without width and height, which should exlude
+                    -- Ignore img without width and height, which should exclude
                     -- javascript maps and other unsupported stuff
                     if width and height then
                         -- Images in the html we got seem to be x4.5 the size of
@@ -437,7 +398,7 @@ local function image_load_bb_func(image, highres)
     logger.dbg("fetching", source)
     local Trapper = require("ui/trapper")
     -- We use dismissableRunInSubprocess with simple string return value to
-    -- avoid dump()/load() a long string of image bytes
+    -- avoid serialization/deserialization of a long string of image bytes
     local completed, data = Trapper:dismissableRunInSubprocess(function()
         local success, data = getUrlContent(source, timeout, maxtime)
         -- With simple string value, we're not able to return the failure
@@ -536,8 +497,8 @@ function Wikipedia:addImages(page, lang, more_images, image_size_factor, hi_imag
         local height = wimage.height or 100
         -- Give a little boost in size to thin images
         if width < height / 2 or height < width / 2 then
-            width = width * 1.3
-            height = height * 1.3
+            width = math.floor(width * 1.3)
+            height = math.floor(height * 1.3)
         end
         width = math.ceil(width * image_size_factor)
         height = math.ceil(height * image_size_factor)
@@ -586,17 +547,17 @@ end
 -- These chosen ones are available in most fonts (prettier symbols
 -- exist in unicode, but are available in a few fonts only) and
 -- have a quite consistent size/weight in all fonts.
-local th1_sym = "\xE2\x96\x88"         -- full block (big black rectangle) (never met, only for web page title?)
-local th2_sym = "\xE2\x96\x89"         -- big black square
-local th3_sym = "\xC2\xA0\xE2\x97\xA4" -- black upper left triangle (indented, nicer)
-local th4_sym = "\xE2\x97\x86"         -- black diamond
-local th5_sym = "\xE2\x9C\xBF"         -- black florette
-local th6_sym = "\xE2\x9D\x96"         -- black diamond minus white x
+local th1_sym = "\u{2588}"         -- full block (big black rectangle) (never met, only for web page title?)
+local th2_sym = "\u{2589}"         -- big black square
+local th3_sym = "\u{00A0}\u{25E4}" -- black upper left triangle (indented, nicer)
+local th4_sym = "\u{25C6}"         -- black diamond
+local th5_sym = "\u{273F}"         -- black florette
+local th6_sym = "\u{2756}"         -- black diamond minus white x
 -- Others available in most fonts
--- local thX_sym = "\xE2\x9C\x9A"         -- heavy greek cross
--- local thX_sym = "\xE2\x97\xA2"         -- black lower right triangle
--- local thX_sym = "\xE2\x97\x89"         -- fish eye
--- local thX_sym = "\xE2\x96\x97"         -- quadrant lower right
+-- local thX_sym = "\u{271A}"         -- heavy greek cross
+-- local thX_sym = "\u{25E2}"         -- black lower right triangle
+-- local thX_sym = "\u{25C9}"         -- fish eye
+-- local thX_sym = "\u{2597}"         -- quadrant lower right
 
 -- For optional prettification of the plain text full page
 function Wikipedia:prettifyText(text)
@@ -611,7 +572,7 @@ function Wikipedia:prettifyText(text)
     text = text:gsub("==$", "==\n")        -- for a </hN> at end of text to be matched by next gsub
     text = text:gsub(" ===?\n+", "\n\n")   -- </h2> to </h3> : empty line after
     text = text:gsub(" ====+\n+", "\n")    -- </h4> to </hN> : single \n, no empty line
-    text = text:gsub("\n\n+\xE2\x80\x94", "\n\xE2\x80\x94") -- em dash, used for quote author, make it stick to prev text
+    text = text:gsub("\n\n+\u{2014}", "\n\u{2014}") -- em dash, used for quote author, make it stick to prev text
     text = text:gsub("\n +\n", "\n")  -- trim lines full of only spaces (often seen in math formulas)
     text = text:gsub("^\n*", "")      -- trim new lines at start
     text = text:gsub("\n*$", "")      -- trim new lines at end
@@ -622,28 +583,29 @@ end
 
 
 -- UTF8 of unicode geometrical shapes we'll prepend to wikipedia section headers,
--- to help identifying hierarchy (othewise, the small font size differences helps).
+-- to help identifying hierarchy (otherwise, the small font size differences helps).
 -- Best if identical to the ones used above for prettifying full plain text page.
 -- These chosen ones are available in most fonts (prettier symbols
 -- exist in unicode, but are available in a few fonts only) and
 -- have a quite consistent size/weight in all fonts.
-local h1_sym = "\xE2\x96\x88"     -- full block (big black rectangle) (never met, only for web page title?)
-local h2_sym = "\xE2\x96\x89"     -- big black square
-local h3_sym = "\xE2\x97\xA4"     -- black upper left triangle
-local h4_sym = "\xE2\x97\x86"     -- black diamond
-local h5_sym = "\xE2\x9C\xBF"     -- black florette
-local h6_sym = "\xE2\x9D\x96"     -- black diamond minus white x
+local h1_sym = "\u{2588}"     -- full block (big black rectangle) (never met, only for web page title?)
+local h2_sym = "\u{2589}"     -- big black square
+local h3_sym = "\u{25E4}"     -- black upper left triangle
+local h4_sym = "\u{25C6}"     -- black diamond
+local h5_sym = "\u{273F}"     -- black florette
+local h6_sym = "\u{2756}"     -- black diamond minus white x
 -- Other available ones in most fonts
--- local hXsym = "\xE2\x9C\x9A"     -- heavy greek cross
--- local hXsym = "\xE2\x97\xA2"     -- black lower right triangle
--- local hXsym = "\xE2\x97\x89"     -- fish eye
--- local hXsym = "\xE2\x96\x97"     -- quadrant lower right
+-- local hXsym = "\u{271A}"     -- heavy greek cross
+-- local hXsym = "\u{25E2}"     -- black lower right triangle
+-- local hXsym = "\u{25C9}"     -- fish eye
+-- local hXsym = "\u{2597}"     -- quadrant lower right
 
 local ext_to_mimetype = {
     png = "image/png",
     jpg = "image/jpeg",
     jpeg = "image/jpeg",
     gif = "image/gif",
+    webp = "image/webp",
     svg = "image/svg+xml",
     html= "application/xhtml+xml",
     xhtml= "application/xhtml+xml",
@@ -737,6 +699,10 @@ function Wikipedia:createEpub(epub_path, page, lang, with_images)
             logger.info("no src found in ", img_tag)
             return nil
         end
+        if src:sub(1,5) == "data:" then
+            logger.dbg("skipping data URI", src)
+            return nil
+        end
         if src:sub(1,2) == "//" then
             src = "https:" .. src -- Wikipedia redirects from http to https, so use https
         elseif src:sub(1,1) == "/" then -- non absolute url
@@ -751,9 +717,14 @@ function Wikipedia:createEpub(epub_path, page, lang, with_images)
         --   https://wikimedia.org/api/rest_v1/#!/Math/get_media_math_render_format_hash
         -- We tweak the url now (and fix the mimetype below), before checking for
         -- duplicates in seen_images.
-        -- Think about disabling that when nanosvg gets better!
+        -- As of mid 2022, crengine has switched from using NanoSVG to LunaSVG extended,
+        -- which makes it able to render such Wikipedia SVGs correctly.
+        -- We need to keep the style= attribute, which usually specifies width and height
+        -- in 'ex' units, and a vertical-align we want to keep to align baselines.
+        local keep_style
         if src:find("/math/render/svg/") then
-            src = src:gsub("/math/render/svg/", "/math/render/png/")
+            -- src = src:gsub("/math/render/svg/", "/math/render/png/") -- no longer needed
+            keep_style = true
         end
         local cur_image
         if seen_images[src] then -- already seen
@@ -765,7 +736,9 @@ function Wikipedia:createEpub(epub_path, page, lang, with_images)
             end
             local ext = src_ext:match(".*%.(%S%S%S?%S?%S?)$") -- extensions are only 2 to 5 chars
             if ext == nil or ext == "" then
-                if src_ext:find("/math/render/png/") then -- tweaked above
+                if src_ext:find("/math/render/svg/") then
+                    ext = "svg"
+                elseif src_ext:find("/math/render/png/") then
                     ext = "png"
                 else
                     -- we won't know what mimetype to use, ignore it
@@ -823,20 +796,27 @@ function Wikipedia:createEpub(epub_path, page, lang, with_images)
             table.insert(style_props, string.format("height: %spx", cur_image.height))
         end
         local style = table.concat(style_props, "; ")
+        if keep_style then -- for /math/render/svg/
+            style = img_tag:match([[style="([^"]*)"]])
+        end
         return string.format([[<img src="%s" style="%s" alt=""/>]], cur_image.imgpath, style)
     end
     html = html:gsub("(<%s*img [^>]*>)", processImg)
     logger.dbg("Images found in html:", images)
 
     -- See what to do with images
-    local include_images = false
-    local use_img_2x = false
+    local include_images = G_reader_settings:readSetting("wikipedia_epub_include_images")
+    local use_img_2x = G_reader_settings:readSetting("wikipedia_epub_highres_images")
     if with_images then
         -- If no UI (Trapper:wrap() not called), UI:confirm() will answer true
         if #images > 0 then
-            include_images = UI:confirm(T(_("This article contains %1 images.\nWould you like to download and include them in the generated EPUB file?"), #images), _("Don't include"), _("Include"))
+            if include_images == nil then
+                include_images = UI:confirm(T(_("This article contains %1 images.\nWould you like to download and include them in the generated EPUB file?"), #images), _("Don't include"), _("Include"))
+            end
             if include_images then
-                use_img_2x = UI:confirm(_("Would you like to use slightly higher quality images? This will result in a bigger file size."), _("Standard quality"), _("Higher quality"))
+                if use_img_2x == nil then
+                    use_img_2x = UI:confirm(_("Would you like to use slightly higher quality images? This will result in a bigger file size."), _("Standard quality"), _("Higher quality"))
+                end
             end
         else
             UI:info(_("This article does not contain any images."))
@@ -867,7 +847,7 @@ function Wikipedia:createEpub(epub_path, page, lang, with_images)
 
     -- ----------------------------------------------------------------
     -- /mimetype : always "application/epub+zip"
-    epub:add("mimetype", "application/epub+zip")
+    epub:add("mimetype", "application/epub+zip", true)
 
     -- ----------------------------------------------------------------
     -- /META-INF/container.xml : always the same content
@@ -895,7 +875,8 @@ function Wikipedia:createEpub(epub_path, page, lang, with_images)
     --     </guide>
     local koreader_version = "KOReader"
     if lfs.attributes("git-rev", "mode") == "file" then
-        koreader_version = "KOReader "..io.open("git-rev", "r"):read()
+        local Version = require("version")
+        koreader_version = "KOReader " .. Version:getCurrentRevision()
     end
     local content_opf_parts = {}
     -- head
@@ -943,6 +924,84 @@ function Wikipedia:createEpub(epub_path, page, lang, with_images)
     -- to look more alike wikipedia web pages (that the user can ignore
     -- with "Embedded Style" off)
     epub:add("OEBPS/stylesheet.css", [[
+/* Generic styling picked from our epub.css (see it for comments),
+   to give this epub a book look even if used with html5.css */
+body {
+  text-align: justify;
+}
+h1, h2, h3, h4, h5, h6 {
+  margin-top: 0.7em;
+  margin-bottom: 0.5em;
+  hyphens: none;
+}
+h1 { font-size: 150%; }
+h2 { font-size: 140%; }
+h3 { font-size: 130%; }
+h4 { font-size: 120%; }
+h5 { font-size: 110%; }
+h6 { font-size: 100%; }
+p {
+  text-indent: 1.2em;
+  margin-top: 0;
+  margin-bottom: 0;
+}
+blockquote {
+  margin-top: 0.5em;
+  margin-bottom: 0.5em;
+  margin-left: 2em;
+  margin-right: 1em;
+}
+blockquote:dir(rtl) {
+  margin-left: 1em;
+  margin-right: 2em;
+}
+dl {
+  margin-left: 0;
+}
+dt {
+  margin-left: 0;
+  margin-top: 0.3em;
+  font-weight: bold;
+}
+dd {
+  margin-left: 1.3em;
+}
+dd:dir(rtl) {
+  margin-left: unset;
+  margin-right: 1.3em;
+}
+pre {
+  text-align: left;
+  margin-top: 0.5em;
+  margin-bottom: 0.5em;
+}
+hr {
+  border-style: solid;
+}
+table {
+  font-size: 80%;
+  margin: 3px 0;
+  border-spacing: 1px;
+}
+table table { /* stop imbricated tables from getting smaller */
+  font-size: 100%;
+}
+th, td {
+  padding: 3px;
+}
+th {
+  background-color: #DDD;
+  text-align: center;
+}
+table caption {
+  padding: 4px;
+  background-color: #EEE;
+}
+sup { font-size: 70%; }
+sub { font-size: 70%; }
+
+/* Specific for our Wikipedia EPUBs */
+
 /* Make section headers looks left aligned and avoid some page breaks */
 h1, h2 {
     page-break-before: always;
@@ -973,13 +1032,31 @@ hr.koreaderwikifrontpage {
     margin-right: 20%;
     margin-bottom: 1.2em;
 }
+/* Have these HR get the same margins and position as our H2 */
+hr.koreaderwikitocstart {
+    page-break-before: always;
+    font-size: 140%;
+    margin: 0.7em 30% 1.5em;
+    height: 0.22em;
+    border: none;
+    background-color: black;
+}
+hr.koreaderwikitocend {
+    page-break-before: avoid;
+    page-break-after: always;
+    font-size: 140%;
+    margin: 1.2em 30% 0;
+    height: 0.22em;
+    border: none;
+    background-color: black;
+}
 
 /* So many links, make them look like normal text except for underline */
 a {
-    display:inline;
+    display: inline;
     text-decoration: underline;
-    color: black;
-    font-weight: normal;
+    color: inherit;
+    font-weight: inherit;
 }
 /* No underline for links without their href that we removed */
 a.newwikinonexistent {
@@ -988,10 +1065,7 @@ a.newwikinonexistent {
 
 /* Don't waste left margin for TOC, notes and other lists */
 ul, ol {
-    margin-left: 0;
-}
-ul:dir(rtl), ol:dir(rtl) {
-    margin-right: 0;
+    margin: 0;
 }
 /* OL in Wikipedia pages may inherit their style-type from a wrapping div,
  * ensure they fallback to decimal with inheritance */
@@ -1000,20 +1074,41 @@ body {
 }
 ol.references {
     list-style-type: inherit;
+    /* Allow hiding these pages as their content is available as footnotes */
+    -cr-hint: non-linear;
 }
 
 /* Show a box around image thumbnails */
-div.thumb {
+figure[typeof~='mw:File/Thumb'],
+figure[typeof~='mw:File/Frame'] {
+    display: table;
     border: dotted 1px black;
     margin:  0.5em 2.5em 0.5em 2.5em;
-    padding: 0.5em 0.5em 0.2em 0.5em;
-    padding-top: ]].. (include_images and "0.5em" or "0.15em") .. [[;
+    padding: 0 0.5em 0 0.5em;
+    padding-top: ]].. (include_images and "0.5em" or "0") .. [[;
     text-align: center;
     font-size: 90%;
     page-break-inside: avoid;
+    -cr-only-if: float-floatboxes;
+        max-width: 50vw; /* ensure we never take half of screen width */
+    -cr-only-if: -float-floatboxes;
+        width: 100% !important;
+    -cr-only-if: legacy;
+        display: block;
 }
-/* Allow main thumbnails to float */
-body > div > div.thumb {
+figure[typeof~='mw:File/Thumb'] > figcaption,
+figure[typeof~='mw:File/Frame'] > figcaption {
+    display: table-caption;
+    caption-side: bottom;
+    padding: 0.2em 0.5em 0.2em 0.5em;
+    /* No padding-top if image, as the image's strut brings some enough spacing */
+    padding-top: ]].. (include_images and "0" or "0.2em") .. [[;
+    -cr-only-if: legacy;
+        display: block;
+}
+/* Allow main thumbnails to float, preferably on the right */
+body > div > figure[typeof~='mw:File/Thumb'],
+body > div > figure[typeof~='mw:File/Frame'] {
     float: right !important;
     /* Change some of their styles when floating */
     -cr-only-if: float-floatboxes;
@@ -1024,39 +1119,48 @@ body > div > div.thumb {
     -cr-only-if: float-floatboxes -allow-style-w-h-absolute-units;
         width: 33% !important;
 }
-body > div:dir(rtl) > div.thumb { /* invert if RTL */
+/* invert if RTL */
+body > div:dir(rtl) > figure[typeof~='mw:File/Thumb'],
+body > div:dir(rtl) > figure[typeof~='mw:File/Frame'] {
     float: left !important;
     -cr-only-if: float-floatboxes;
         clear: left;
         margin:  0 0.5em 0.2em 0 !important;
 }
 /* Allow original mix of left/right floats in web mode */
-body > div > div.thumb.tleft {
+body > div > figure[typeof~='mw:File/Thumb'].mw-halign-left,
+body > div > figure[typeof~='mw:File/Frame'].mw-halign-left {
     -cr-only-if: float-floatboxes allow-style-w-h-absolute-units;
         float: left !important;
         clear: left;
         margin:  0 0.5em 0.2em 0 !important;
 }
-body > div > div.thumb.tright {
+body > div > figure[typeof~='mw:File/Thumb'].mw-halign-right,
+body > div > figure[typeof~='mw:File/Frame'].mw-halign-right {
     -cr-only-if: float-floatboxes allow-style-w-h-absolute-units;
         float: right !important;
         clear: right;
         margin:  0 0 0.2em 0.5em !important;
 }
-
-body > div > div.thumb img {
+body > div > figure[typeof~='mw:File/Thumb'] > img,
+body > div > figure[typeof~='mw:File/Frame'] > img {
     /* Make float's inner images 100% of their container's width when not in "web" mode */
     -cr-only-if: float-floatboxes -allow-style-w-h-absolute-units;
         width: 100% !important;
         height: 100% !important;
 }
-
-/* Some other (usually wide) thumbnails are wrapped in a DIV.center:
- * avoid having them overflowing in web mode (no issue in other modes).
- * (Use "width: auto", as crengine does not support "max-width:") */
-body > div > div.center > div.thumb * {
-    -cr-only-if: allow-style-w-h-absolute-units;
-        width: auto !important;
+/* For centered figure, we need to reset a few things, and to not
+ * use display:table if we want them wide and centered */
+body > div > figure[typeof~='mw:File/Thumb'].mw-halign-center,
+body > div > figure[typeof~='mw:File/Frame'].mw-halign-center {
+    display: block;
+    float: none !important;
+    margin:  0.5em 2.5em 0.5em 2.5em !important;
+    max-width: none;
+}
+body > div > figure[typeof~='mw:File/Thumb'].mw-halign-center > figcaption,
+body > div > figure[typeof~='mw:File/Frame'].mw-halign-center > figcaption{
+    display: block;
 }
 
 /* Style gallery and the galleryboxes it contains.
@@ -1109,6 +1213,7 @@ li.gallerybox {
     -cr-only-if: -float-floatboxes;
         width: 100% !important; /* flat mode: force full width */
     -cr-only-if: float-floatboxes;
+        font-size: 80%;
         /* Remove our wide horizontal margins in book/web modes */
         margin:  0.5em 0.5em 0.5em 0.5em !important;
     -cr-only-if: float-floatboxes -allow-style-w-h-absolute-units;
@@ -1125,6 +1230,7 @@ li.gallerybox div.thumb {
     border: solid 1px white;
     margin: 0;
     padding: 0;
+    height: auto !important;
 }
 li.gallerybox div.thumb div {
     /* Override this one often set in style="" with various values */
@@ -1154,6 +1260,11 @@ table {
 .citation {
     font-style: italic;
 }
+abbr.abbr {
+    /* Prevent these from looking like a link */
+    text-decoration: inherit;
+}
+
 /* hide some view/edit/discuss short links displayed as "v m d" */
 .nv-view, .nv-edit, .nv-talk {
     display: none;
@@ -1243,8 +1354,66 @@ table {
     epub:add("OEBPS/toc.ncx", table.concat(toc_ncx_parts))
 
     -- ----------------------------------------------------------------
+    -- HTML table of content
+    -- We used to have it in the HTML we got from Wikipedia, but we no longer do.
+    -- So, build it from the 'sections' we got from the API.
+    local toc_html_parts = {}
+    -- Unfortunately, we don't and can't get any localized "Contents" or "Sommaire" to use
+    -- as a heading. So, use some <hr> at start and at end to make this HTML ToC stand out.
+    table.insert(toc_html_parts, '<hr class="koreaderwikitocstart"/>\n')
+    cur_level = 0
+    for isec, s in ipairs(sections) do
+        -- Some chars in headings are converted to html entities in the
+        -- wikipedia-generated HTML. We need to do the same in TOC links
+        -- for the links to be valid.
+        local s_anchor = s.anchor:gsub("&", "&amp;"):gsub('"', "&quot;"):gsub(">", "&gt;"):gsub("<", "&lt;")
+        local s_title = string.format("%s %s", s.number, s.line)
+        local s_level = s.toclevel
+        if s_level == cur_level then
+            table.insert(toc_html_parts, "</li>")
+        elseif s_level < cur_level then
+            table.insert(toc_html_parts, "</li>")
+            while cur_level > s_level do
+                cur_level = cur_level - 1
+                table.insert(toc_html_parts, "\n"..(" "):rep(cur_level))
+                table.insert(toc_html_parts, "</ul>")
+                table.insert(toc_html_parts, "\n"..(" "):rep(cur_level))
+                table.insert(toc_html_parts, "</li>")
+            end
+        else -- s_level > cur_level
+            while cur_level < s_level do
+                table.insert(toc_html_parts, "\n"..(" "):rep(cur_level))
+                table.insert(toc_html_parts, "<ul>")
+                cur_level = cur_level + 1
+            end
+        end
+        cur_level = s_level
+        table.insert(toc_html_parts, "\n"..(" "):rep(cur_level))
+        table.insert(toc_html_parts, string.format([[<li><div><a href="#%s">%s</a></div>]], s_anchor, s_title))
+    end
+    -- close nested <ul>
+    table.insert(toc_html_parts, "</li>")
+    while cur_level > 0 do
+        cur_level = cur_level - 1
+        table.insert(toc_html_parts, "\n"..(" "):rep(cur_level))
+        table.insert(toc_html_parts, "</ul>")
+        if cur_level > 0 then
+            table.insert(toc_html_parts, "\n"..(" "):rep(cur_level))
+            table.insert(toc_html_parts, "</li>")
+        end
+    end
+    table.insert(toc_html_parts, '<hr class="koreaderwikitocend"/>\n')
+    html = html:gsub([[<meta property="mw:PageProp/toc" />]], table.concat(toc_html_parts))
+
+    -- ----------------------------------------------------------------
     -- OEBPS/content.html
     -- Some small fixes to Wikipedia HTML to make crengine and the user happier
+
+    -- In some articles' HTML, we may get <link rel="mw-deduplicated-inline-style" href="mw-data...">
+    -- (which, by specs, is an empty element) without the proper empty tag ending "/>", which
+    -- would cause crengine's EPUB XHTML parser to wait for a proper </link>, hiding all the
+    -- following content... So, just remove them, as we don't make any use of them.
+    html = html:gsub("<link [^>]*>", "")
 
     -- Most images are in a link to the image info page, which is a useless
     -- external link for us, so let's remove this link.
@@ -1253,7 +1422,7 @@ table {
     -- crengine does not support the <math> family of tags for displaying formulas,
     -- which results in lots of space taken by individual character in the formula,
     -- each on a single line...
-    -- Also, usally, these <math> tags are followed by a <img> tag pointing to a
+    -- Also, usually, these <math> tags are followed by a <img> tag pointing to a
     -- SVG version of the formula, that we took care earlier to change the url to
     -- point to a PNG version of the formula (which is still not perfect, as it does
     -- not adjust to the current html font size, but it is at least readable).
@@ -1278,7 +1447,7 @@ table {
     end
     html = html:gsub([[href="/wiki/([^"]*)"]], cleanWikiPageTitle)
 
-    -- Remove href from links to non existant wiki page so they are not clickable :
+    -- Remove href from links to nonexistent wiki page so they are not clickable :
     -- <a href="/w/index.php?title=PageTitle&amp;action=edit&amp;redlink=1" class="new"
     --          title="PageTitle">PageTitle____on</a>
     -- (removal of the href="" will make them non clickable)
@@ -1289,12 +1458,12 @@ table {
 
     if self.wiki_prettify then
         -- Prepend some symbols to section titles for a better visual feeling of hierarchy
-        html = html:gsub("<h1>", "<h1> "..h1_sym.." ")
-        html = html:gsub("<h2>", "<h2> "..h2_sym.." ")
-        html = html:gsub("<h3>", "<h3> "..h3_sym.." ")
-        html = html:gsub("<h4>", "<h4> "..h4_sym.." ")
-        html = html:gsub("<h5>", "<h5> "..h5_sym.." ")
-        html = html:gsub("<h6>", "<h6> "..h6_sym.." ")
+        html = html:gsub("(<h1[^>]*>)", "%1 "..h1_sym.." ")
+        html = html:gsub("(<h2[^>]*>)", "%1 "..h2_sym.." ")
+        html = html:gsub("(<h3[^>]*>)", "%1 "..h3_sym.." ")
+        html = html:gsub("(<h4[^>]*>)", "%1 "..h4_sym.." ")
+        html = html:gsub("(<h5[^>]*>)", "%1 "..h5_sym.." ")
+        html = html:gsub("(<h6[^>]*>)", "%1 "..h6_sym.." ")
     end
 
     -- Note: in all the gsub patterns above, we used lowercase for tags and attributes
@@ -1335,14 +1504,22 @@ table {
     -- OEBPS/images/*
     if include_images then
         local nb_images = #images
+        local before_images_time = time.now()
+        local time_prev = before_images_time
         for inum, img in ipairs(images) do
-            -- Process can be interrupted at this point between each image download
+            -- Process can be interrupted every second between image downloads
             -- by tapping while the InfoMessage is displayed
             -- We use the fast_refresh option from image #2 for a quicker download
-            local go_on = UI:info(T(_("Retrieving image %1 / %2 …"), inum, nb_images), inum >= 2)
-            if not go_on then
-                cancelled = true
-                break
+            local go_on
+            if time.to_ms(time.since(time_prev)) > 1000 then
+                time_prev = time.now()
+                go_on = UI:info(T(_("Retrieving image %1 / %2 …"), inum, nb_images), inum >= 2)
+                if not go_on then
+                    cancelled = true
+                    break
+                end
+            else
+                UI:info(T(_("Retrieving image %1 / %2 …"), inum, nb_images), inum >= 2, true)
             end
             local src = img.src
             if use_img_2x and img.src2x then
@@ -1371,6 +1548,7 @@ table {
                 end
             end
         end
+        logger.dbg("Image download time for:", page_htmltitle, time.to_ms(time.since(before_images_time)), "ms")
     end
 
     -- Done with adding files

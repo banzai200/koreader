@@ -11,6 +11,7 @@
 [![Weblate Status][badge-weblate]][link-weblate]
 
 [Download](https://github.com/koreader/koreader/releases) •
+[User guide](http://koreader.rocks/user_guide/) •
 [Wiki](https://github.com/koreader/koreader/wiki) •
 [Developer docs](http://koreader.rocks/doc/)
 
@@ -18,19 +19,21 @@
 
 * **portable**: runs on embedded devices (Cervantes, Kindle, Kobo, PocketBook, reMarkable), Android and Linux computers. Developers can run a KOReader emulator in Linux and MacOS.
 
-* **multi-format documents**: supports fixed page formats (PDF, DjVu, CBT, CBZ) and reflowable e-book formats (EPUB, FB2, Mobi, DOC, CHM, TXT). Scanned PDF/DjVu documents can also be reflowed with the built-in K2pdfopt library.
+* **multi-format documents**: supports fixed page formats (PDF, DjVu, CBT, CBZ) and reflowable e-book formats (EPUB, FB2, Mobi, DOC, RTF, HTML, CHM, TXT). Scanned PDF/DjVu documents can also be reflowed with the built-in K2pdfopt library. [ZIP files][link-wiki-zip] are also supported for some formats.
 
 * **full-featured reading**: multi-lingual user interface with a highly customizable reader view and many typesetting options. You can set arbitrary page margins, override line spacing and choose external fonts and styles. It has multi-lingual hyphenation dictionaries bundled into the application.
 
-* **integrated** with *calibre* (search metadata, receive ebooks wirelessly, browse library via OPDS),  *Evernote* (export hightlights), *Wallabag*, *Wikipedia*, *Google Translate* and other content providers.
+* **integrated** with *calibre* (search metadata, receive ebooks wirelessly, browse library via OPDS), *Wallabag*, *Wikipedia*, *Google Translate* and other content providers.
 
 * **optimized for e-ink devices**: custom UI without animation, with paginated menus, adjustable text contrast, and easy zoom to fit content or page in paged media.
 
 * **extensible**: via plugins
 
-* **and much more**: look up words with StarDict dictionaries / Wikipedia, add your own online OPDS catalogs and RSS feeds, share ebooks with other KOReader devices wirelessly, online over-the-air software updates, an FTP client, an SSH server, …
+* **fast**: on some older devices, it has been measured to have less than half the page-turn delay as the built in reading software.
 
-Please check the [wiki][link-wiki] to discover more features and to help us document them.
+* **and much more**: look up words with StarDict dictionaries / Wikipedia, add your own online OPDS catalogs and RSS feeds, over-the-air software updates, an FTP client, an SSH server, …
+
+Please check the [user guide](http://koreader.rocks/user_guide/) and the [wiki][link-wiki] to discover more features and to help us document them.
 
 ## Screenshots
 
@@ -53,7 +56,7 @@ Please follow the model specific steps for your device:
 
 ## Development
 
-[Setting a build environment](doc/Building.md) •
+[Setting up a build environment](doc/Building.md) •
 [Collaborating with Git](doc/Collaborating_with_Git.md) •
 [Building targets](doc/Building_targets.md) •
 [Porting](doc/Porting.md) •
@@ -68,23 +71,12 @@ KOReader is developed and supported by volunteers all around the world. There ar
 - document lesser-known features on the [wiki][link-wiki]
 - help others with your knowledge on the [forum][link-forum]
 
-Right now we only support [liberapay](https://liberapay.com/KOReader) donations, but you can also create a [bounty][link-bountysource] to motivate others to work on a specific bug or feature request.
-
-Also if you have and old Pocketbook device you don't want, we might find it useful to tinker a bit with that platform. Please contact us through the forum or GitHub.
+Right now we only support [liberapay](https://liberapay.com/KOReader) donations.
 
 ## Contributors
 
 [![Last commit][badge-last-commit]][link-gh-commits]
 [![Commit activity][badge-commit-activity]][link-gh-insights]
-
-[![0](https://sourcerer.io/fame/Frenzie/koreader/koreader/images/0)](https://sourcerer.io/fame/Frenzie/koreader/koreader/links/0)
-[![1](https://sourcerer.io/fame/Frenzie/koreader/koreader/images/1)](https://sourcerer.io/fame/Frenzie/koreader/koreader/links/1)
-[![2](https://sourcerer.io/fame/Frenzie/koreader/koreader/images/2)](https://sourcerer.io/fame/Frenzie/koreader/koreader/links/2)
-[![3](https://sourcerer.io/fame/Frenzie/koreader/koreader/images/3)](https://sourcerer.io/fame/Frenzie/koreader/koreader/links/3)
-[![4](https://sourcerer.io/fame/Frenzie/koreader/koreader/images/4)](https://sourcerer.io/fame/Frenzie/koreader/koreader/links/4)
-[![5](https://sourcerer.io/fame/Frenzie/koreader/koreader/images/5)](https://sourcerer.io/fame/Frenzie/koreader/koreader/links/5)
-[![6](https://sourcerer.io/fame/Frenzie/koreader/koreader/images/6)](https://sourcerer.io/fame/Frenzie/koreader/koreader/links/6)
-[![7](https://sourcerer.io/fame/Frenzie/koreader/koreader/images/7)](https://sourcerer.io/fame/Frenzie/koreader/koreader/links/7)
 
 [badge-bountysource]:https://img.shields.io/bountysource/team/koreader/activity?color=red
 [badge-circleci]:https://circleci.com/gh/koreader/koreader.svg?style=shield
@@ -109,3 +101,4 @@ Also if you have and old Pocketbook device you don't want, we might find it usef
 [link-issues-features]:https://github.com/koreader/koreader/issues?q=is%3Aopen+is%3Aissue+label%3Aenhancement
 [link-weblate]:https://hosted.weblate.org/engage/koreader/?utm_source=widget
 [link-wiki]:https://github.com/koreader/koreader/wiki
+[link-wiki-zip]:https://github.com/koreader/koreader/wiki/ZIP

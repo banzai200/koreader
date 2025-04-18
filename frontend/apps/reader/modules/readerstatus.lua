@@ -1,34 +1,17 @@
-local BD = require("ui/bidi")
 local BookStatusWidget = require("ui/widget/bookstatuswidget")
-local ButtonDialogTitle = require("ui/widget/buttondialogtitle")
+local ButtonDialog = require("ui/widget/buttondialog")
 local Device = require("device")
-local Event = require("ui/event")
 local InfoMessage = require("ui/widget/infomessage")
-local InputContainer = require("ui/widget/container/inputcontainer")
 local UIManager = require("ui/uimanager")
+local WidgetContainer = require("ui/widget/container/widgetcontainer")
+local util = require("util")
 local _ = require("gettext")
-local T = require("ffi/util").template
 
-local ReaderStatus = InputContainer:new {
-    document = nil,
-    summary = {
-        rating = 0,
-        note = nil,
-        status = "",
-        modified = "",
-    },
-    enabled = true,
-    total_pages = 0
+local ReaderStatus = WidgetContainer:extend{
 }
 
 function ReaderStatus:init()
-    if self.ui.document.is_pic then
-        self.enabled = false
-        return
-    else
-        self.total_pages = self.document:getPageCount()
-        self.ui.menu:registerToMainMenu(self)
-    end
+    self.ui.menu:registerToMainMenu(self)
 end
 
 function ReaderStatus:addToMainMenu(menu_items)
@@ -40,41 +23,57 @@ function ReaderStatus:addToMainMenu(menu_items)
     }
 end
 
+function ReaderStatus:onShowBookStatus(close_callback)
+    local status_page = BookStatusWidget:new{
+        ui = self.ui,
+        close_callback = close_callback,
+    }
+    UIManager:show(status_page, "full")
+    return true
+end
+
+-- End of book
+
 function ReaderStatus:onEndOfBook()
     Device:performHapticFeedback("CONTEXT_CLICK")
-    local settings = G_reader_settings:readSetting("end_document_action")
-    local choose_action
-    local collate = true
     local QuickStart = require("ui/quickstart")
     local last_file = G_reader_settings:readSetting("lastfile")
-    if last_file and last_file == QuickStart.quickstart_filename then
-        self:openFileBrowser()
+    if last_file == QuickStart.quickstart_filename then
+        -- Like onOpenNextOrPreviousFileInFolder, delay this so as not to break instance lifecycle
+        UIManager:nextTick(function()
+            self:openFileBrowser()
+        end)
         return
     end
-    if G_reader_settings:readSetting("collate") == "access" then
-        collate = false
+
+    -- Should we start by marking the book as finished?
+    if G_reader_settings:isTrue("end_document_auto_mark") then
+        self:markBook(true)
     end
-    if settings == "pop-up" or settings == nil then
+
+    local collate = G_reader_settings:readSetting("collate")
+    local next_file_enabled = collate ~= "access" and collate ~= "date"
+    local settings = G_reader_settings:readSetting("end_document_action") or "pop-up"
+    local top_widget = UIManager:getTopmostVisibleWidget() or {}
+    if settings == "pop-up" and top_widget.name ~= "end_document" then
+        local button_dialog
         local buttons = {
             {
                 {
                     text_func = function()
-                        if self.settings.data.summary and self.settings.data.summary.status == "complete" then
-                            return _("Mark as reading")
-                        else
-                            return _("Mark as read")
-                        end
+                        local status = self.ui.doc_settings:readSetting("summary").status
+                        return status == "complete" and _("Mark as reading") or _("Mark as finished")
                     end,
                     callback = function()
-                        self:onMarkBook()
-                        UIManager:close(choose_action)
+                        UIManager:close(button_dialog)
+                        self:markBook()
                     end,
                 },
                 {
                     text = _("Book status"),
                     callback = function()
+                        UIManager:close(button_dialog)
                         self:onShowBookStatus()
-                        UIManager:close(choose_action)
                     end,
                 },
 
@@ -83,16 +82,16 @@ function ReaderStatus:onEndOfBook()
                 {
                     text = _("Go to beginning"),
                     callback = function()
-                        self.ui:handleEvent(Event:new("GoToBeginning"))
-                        UIManager:close(choose_action)
+                        UIManager:close(button_dialog)
+                        self.ui.gotopage:onGoToBeginning()
                     end,
                 },
                 {
                     text = _("Open next file"),
-                    enabled = collate,
+                    enabled = next_file_enabled,
                     callback = function()
-                        self:openNextFile(self.document.file)
-                        UIManager:close(choose_action)
+                        UIManager:close(button_dialog)
+                        self:onOpenNextOrPreviousFileInFolder()
                     end,
                 },
             },
@@ -100,155 +99,120 @@ function ReaderStatus:onEndOfBook()
                 {
                     text = _("Delete file"),
                     callback = function()
-                        self:deleteFile(self.document.file, false)
-                        UIManager:close(choose_action)
+                        UIManager:close(button_dialog)
+                        self:deleteFile()
                     end,
                 },
                 {
                     text = _("File browser"),
                     callback = function()
-                        self:openFileBrowser()
-                        UIManager:close(choose_action)
-                    end,
-                },
-            },
-            {
-                {
-                    text = _("Cancel"),
-                    callback = function()
-                        UIManager:close(choose_action)
+                        UIManager:close(button_dialog)
+                        -- Ditto
+                        UIManager:nextTick(function()
+                            self:openFileBrowser()
+                        end)
                     end,
                 },
             },
         }
-        choose_action = ButtonDialogTitle:new{
+        button_dialog = ButtonDialog:new{
+            name = "end_document",
             title = _("You've reached the end of the document.\nWhat would you like to do?"),
             title_align = "center",
             buttons = buttons,
         }
-
-        UIManager:show(choose_action)
+        UIManager:show(button_dialog)
     elseif settings == "book_status" then
         self:onShowBookStatus()
     elseif settings == "next_file" then
-        if G_reader_settings:readSetting("collate") ~= "access" then
+        if next_file_enabled then
             local info = InfoMessage:new{
                 text = _("Searching next file…"),
             }
             UIManager:show(info)
             UIManager:forceRePaint()
-            self:openNextFile(self.document.file)
             UIManager:close(info)
+            self:onOpenNextOrPreviousFileInFolder()
         else
             UIManager:show(InfoMessage:new{
-                text = _("Could not open next file. Sort by last read date does not support this feature."),
+                text = _("Could not open next file. Sort by date does not support this feature."),
             })
         end
     elseif settings == "goto_beginning" then
-        self.ui:handleEvent(Event:new("GoToBeginning"))
+        self.ui.gotopage:onGoToBeginning()
     elseif settings == "file_browser" then
-        self:openFileBrowser()
+        -- Ditto
+        UIManager:nextTick(function()
+            self:openFileBrowser()
+        end)
     elseif settings == "mark_read" then
-        self:onMarkBook(true)
+        self:markBook(true)
         UIManager:show(InfoMessage:new{
-            text = _("You've reached the end of the document.\nThe current book is marked as read."),
+            text = _("You've reached the end of the document.\nThe current book is marked as finished."),
             timeout = 3
         })
     elseif settings == "book_status_file_browser" then
-        local before_show_callback = function() self:openFileBrowser() end
-        self:onShowBookStatus(before_show_callback)
+        -- Ditto
+        UIManager:nextTick(function()
+            local book_status_close_callback = function() self:openFileBrowser() end
+            self:onShowBookStatus(book_status_close_callback)
+        end)
     elseif settings == "delete_file" then
-        self:deleteFile(self.document.file, true)
+        -- Ditto
+        UIManager:nextTick(function()
+            self:deleteFile()
+        end)
     end
 end
 
 function ReaderStatus:openFileBrowser()
-    local FileManager = require("apps/filemanager/filemanager")
+    local file = self.document.file
     self.ui:onClose()
-    if not FileManager.instance then
-        self.ui:showFileManager()
-    end
-    self.document = nil
+    self.ui:showFileManager(file)
 end
 
-function ReaderStatus:openNextFile(next_file)
-    local FileManager = require("apps/filemanager/filemanager")
-    if not FileManager.instance then
-        self.ui:showFileManager()
-    end
-    next_file = FileManager.instance.file_chooser:getNextFile(next_file)
-    FileManager.instance:onClose()
-    if next_file then
-        self.ui:switchDocument(next_file)
+function ReaderStatus:onOpenNextOrPreviousFileInFolder(prev)
+    local collate = G_reader_settings:readSetting("collate")
+    if collate == "access" or collate == "date" then return true end
+    local FileChooser = require("ui/widget/filechooser")
+    local fc = FileChooser:new{ ui = self.ui }
+    local file = fc:getNextOrPreviousFileInFolder(self.document.file, prev)
+    if file then
+        -- Delay until the next tick, as this will destroy the Document instance,
+        -- but we may not be the final Event caught by said Document...
+        UIManager:nextTick(function()
+            self.ui:switchDocument(file)
+        end)
     else
         UIManager:show(InfoMessage:new{
-            text = _("This is the last file in the current folder. No next file to open."),
+            text = prev and _("This is the first file in the folder. No previous file to open.")
+                         or _("This is the last file in the folder. No next file to open."),
         })
     end
-end
-
-function ReaderStatus:deleteFile(file, text_end_book)
-    local ConfirmBox = require("ui/widget/confirmbox")
-    local message_end_book = ""
-    if text_end_book then
-        message_end_book = "You've reached the end of the document.\n"
-    end
-    UIManager:show(ConfirmBox:new{
-        text = T(_("%1Are you sure that you want to delete this file?\n%2\nIf you delete a file, it is permanently lost."), message_end_book, BD.filepath(file)),
-        ok_text = _("Delete"),
-        ok_callback = function()
-            local FileManager = require("apps/filemanager/filemanager")
-            local filemanagerutil = require("apps/filemanager/filemanagerutil")
-            FileManager:deleteFile(file)
-            filemanagerutil.removeFileFromHistoryIfWanted(file)
-            filemanagerutil.ensureLastFileExists()
-            if FileManager.instance then
-                FileManager.instance.file_chooser:refreshPath()
-            end
-            self:openFileBrowser()
-        end,
-    })
-end
-
-function ReaderStatus:onShowBookStatus(before_show_callback)
-    local status_page = BookStatusWidget:new {
-        thumbnail = self.document:getCoverPageImage(),
-        props = self.document:getProps(),
-        document = self.document,
-        settings = self.settings,
-        view = self.view,
-    }
-    if before_show_callback then
-        before_show_callback()
-    end
-    status_page.dithered = true
-    UIManager:show(status_page, "full")
     return true
 end
 
--- If mark_read is true then we change status only from reading/abandoned to read (complete).
--- Otherwise we change status from reading/abandoned to read or from read to reading.
-function ReaderStatus:onMarkBook(mark_read)
-    if self.settings.data.summary and self.settings.data.summary.status then
-        local current_status = self.settings.data.summary.status
-        if current_status == "complete" then
-            if mark_read then
-                -- Keep mark as read.
-                self.settings.data.summary.status = "complete"
-            else
-                -- Change current status from read (complete) to reading
-                self.settings.data.summary.status = "reading"
-            end
-        else
-            self.settings.data.summary.status = "complete"
-        end
-    else
-        self.settings.data.summary = {status = "complete"}
+function ReaderStatus:deleteFile()
+    self.ui.doc_settings:flush() -- enable additional warning text for newly opened file
+    local FileManager = require("apps/filemanager/filemanager")
+    local function pre_delete_callback()
+        self.ui:onClose()
     end
+    local function post_delete_callback()
+        local path = util.splitFilePathName(self.document.file)
+        FileManager:showFiles(path)
+    end
+    FileManager:showDeleteFileDialog(self.document.file, post_delete_callback, pre_delete_callback)
 end
 
-function ReaderStatus:onReadSettings(config)
-    self.settings = config
+-- If mark_read is true then we change status only from reading/abandoned to complete.
+-- Otherwise we change status from reading/abandoned to complete or from complete to reading.
+function ReaderStatus:markBook(mark_read)
+    local summary = self.ui.doc_settings:readSetting("summary")
+    summary.status = (not mark_read and summary.status == "complete") and "reading" or "complete"
+    summary.modified = os.date("%Y-%m-%d", os.time())
+    -- If History is called over Reader, it will read the file to get the book status, so flush
+    self.ui.doc_settings:flush()
 end
 
 return ReaderStatus

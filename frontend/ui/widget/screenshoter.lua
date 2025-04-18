@@ -1,24 +1,26 @@
 local BD = require("ui/bidi")
-local ButtonDialogTitle = require("ui/widget/buttondialogtitle")
-local ConfirmBox = require("ui/widget/confirmbox")
+local ButtonDialog = require("ui/widget/buttondialog")
 local DataStorage = require("datastorage")
+local Device = require("device")
 local GestureRange = require("ui/gesturerange")
-local InfoMessage = require("ui/widget/infomessage")
 local InputContainer = require("ui/widget/container/inputcontainer")
 local UIManager = require("ui/uimanager")
+local ffiutil = require("ffi/util")
+local filemanagerutil = require("apps/filemanager/filemanagerutil")
+local util = require("util")
 local Screen = require("device").screen
-local T = require("ffi/util").template
 local _ = require("gettext")
 
-local Screenshoter = InputContainer:new{
-    prefix = 'Screenshot',
+local Screenshoter = InputContainer:extend{
+    prefix = "Screenshot",
+    default_dir = DataStorage:getFullDataDir() .. "/screenshots",
 }
 
 function Screenshoter:init()
-    local diagonal = math.sqrt(
-        math.pow(Screen:getWidth(), 2) +
-        math.pow(Screen:getHeight(), 2)
-    )
+    self:registerKeyEvents()
+    if not Device:isTouchDevice() then return end
+
+    local diagonal = math.sqrt(Screen:getWidth()^2 + Screen:getHeight()^2)
     self.ges_events = {
         TapDiagonal = {
             GestureRange:new{
@@ -37,67 +39,123 @@ function Screenshoter:init()
     }
 end
 
-function Screenshoter:onScreenshot(filename)
-    local screenshots_dir = G_reader_settings:readSetting("screenshot_dir") or DataStorage:getDataDir() .. "/screenshots/"
-    self.screenshot_fn_fmt = screenshots_dir .. self.prefix .. "_%Y-%b-%d_%H%M%S.png"
-    local screenshot_name = filename or os.date(self.screenshot_fn_fmt)
+function Screenshoter:getScreenshotDir()
+    local screenshot_dir = G_reader_settings:readSetting("screenshot_dir")
+    if screenshot_dir and util.makePath(screenshot_dir) then
+        return screenshot_dir:gsub("/$", "")
+    end
+    return self.default_dir
+end
+
+function Screenshoter:onScreenshot(screenshot_name, caller_callback)
+    local prefix = self.prefix
+    local file = self.ui.document and self.ui.document.file -- currently opened book
+    if file then
+        local curr_page = "p" .. self.ui:getCurrentPage()
+        if self.ui.pagemap and self.ui.pagemap:wantsPageLabels() then
+            curr_page = "p_" .. self.ui.pagemap:getCurrentPageLabel(true)
+        end
+        prefix = self.prefix .. "_" .. ffiutil.basename(file) .. "_" .. curr_page
+    end
+    if not screenshot_name then
+        screenshot_name = os.date(self:getScreenshotDir() .. "/" .. prefix .. "_%Y-%m-%d_%H%M%S.png")
+    end
     Screen:shot(screenshot_name)
-    local widget = ConfirmBox:new{
-        text = T( _("Saved screenshot to %1.\nWould you like to set it as screensaver?"), BD.filepath(screenshot_name)),
-        ok_text = _("Yes"),
-        ok_callback = function()
-            G_reader_settings:saveSetting("screensaver_type", "image_file")
-            G_reader_settings:saveSetting("screensaver_image", screenshot_name)
-        end,
-        cancel_text = _("No"),
+
+    local dialog
+    local buttons = {
+        {
+            {
+                text = _("Delete"),
+                callback = function()
+                    os.remove(screenshot_name)
+                    dialog:onClose()
+                end,
+            },
+            {
+                text = _("Set as book cover"),
+                enabled = file and true or false,
+                callback = function()
+                    self.ui.bookinfo:setCustomCoverFromImage(file, screenshot_name)
+                    os.remove(screenshot_name)
+                    dialog:onClose()
+                end,
+            },
+        },
+        {
+            {
+                text = _("View"),
+                callback = function()
+                    local ImageViewer = require("ui/widget/imageviewer")
+                    local image_viewer = ImageViewer:new{
+                        file = screenshot_name,
+                        modal = true,
+                        with_title_bar = false,
+                        buttons_visible = true,
+                    }
+                    UIManager:show(image_viewer)
+                end,
+            },
+        },
     }
-    UIManager:show(widget)
+    if Device:supportsScreensaver() then
+        table.insert(buttons[2], {
+            text = _("Set as wallpaper"),
+            callback = function()
+                G_reader_settings:saveSetting("screensaver_type", "document_cover")
+                G_reader_settings:saveSetting("screensaver_document_cover", screenshot_name)
+                dialog:onClose()
+            end,
+        })
+    end
+    dialog = ButtonDialog:new{
+        title = _("Screenshot saved to:") .. "\n\n" .. BD.filepath(screenshot_name) .. "\n",
+        modal = true,
+        buttons = buttons,
+        tap_close_callback = function()
+            if type(caller_callback) == "function" then
+                caller_callback()
+            end
+            local current_path = self.ui.file_chooser and self.ui.file_chooser.path
+            if current_path and current_path .. "/" == screenshot_name:match(".*/") then
+                self.ui.file_chooser:refreshPath()
+            end
+        end,
+    }
+    UIManager:show(dialog)
     -- trigger full refresh
     UIManager:setDirty(nil, "full")
     return true
 end
 
+Screenshoter.onKeyPressShoot = Screenshoter.onScreenshot
+Screenshoter.onTapDiagonal = Screenshoter.onScreenshot
+Screenshoter.onSwipeDiagonal = Screenshoter.onScreenshot
+
 function Screenshoter:chooseFolder()
-    local buttons = {}
-    table.insert(buttons, {
-        {
-            text = _("Choose screenshot directory"),
-            callback = function()
-                UIManager:close(self.choose_dialog)
-                require("ui/downloadmgr"):new{
-                    onConfirm = function(path)
-                        G_reader_settings:saveSetting("screenshot_dir", path .. "/")
-                        UIManager:show(InfoMessage:new{
-                            text = T(_("Screenshot directory set to:\n%1"), BD.dirpath(path)),
-                            timeout = 3,
-                        })
-                    end,
-                }:chooseDir()
-            end,
-        }
-    })
-    table.insert(buttons, {
-        {
-            text = _("Close"),
-            callback = function()
-                UIManager:close(self.choose_dialog)
-            end,
-        }
-    })
-    local screenshot_dir = G_reader_settings:readSetting("screenshot_dir") or DataStorage:getDataDir() .. "/screenshots/"
-    self.choose_dialog = ButtonDialogTitle:new{
-        title = T(_("Current screenshot directory:\n%1"), BD.dirpath(screenshot_dir)),
-        buttons = buttons
-    }
-    UIManager:show(self.choose_dialog)
+    local title_header = _("Current screenshot folder:")
+    local current_path = G_reader_settings:readSetting("screenshot_dir")
+    local default_path = self.default_dir
+    local caller_callback = function(path)
+        G_reader_settings:saveSetting("screenshot_dir", path)
+    end
+    filemanagerutil.showChooseDialog(title_header, caller_callback, current_path, default_path)
 end
 
-function Screenshoter:onTapDiagonal()
-    return self:onScreenshot()
+function Screenshoter:registerKeyEvents()
+    if Device:hasKeyboard() then
+        self.key_events.KeyPressShoot = {
+            { "Alt", "Shift", "G" }, -- same as stock Kindle firmware
+        }
+    elseif Device:hasScreenKB() then
+        -- kindle 4 case: same as stock firmware.
+        self.key_events.KeyPressShoot = {
+            { "ScreenKB", "Menu" },
+        }
+        -- unable to add other non-touch devices as simultaneous key presses won't work without modifiers
+    end
 end
 
-function Screenshoter:onSwipeDiagonal()
-    return self:onScreenshot()
-end
+Screenshoter.onPhysicalKeyboardConnected = Screenshoter.registerKeyEvents
 
 return Screenshoter

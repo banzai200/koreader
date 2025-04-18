@@ -2,8 +2,8 @@
 -- This also supports the natural light, which consists of additional
 -- red and green light LEDs.
 
-local logger = require("logger")
 local dbg = require("dbg")
+local ffiUtil = require("ffi/util")
 
 local SysfsLight = {
     frontlight_white = nil,
@@ -53,6 +53,7 @@ dbg:guard(SysfsLight, 'setWarmth',
                      "Wrong warmth value given!")
           end)
 
+--- @note: warmth is already in the *native* scale!
 function SysfsLight:setNaturalBrightness(brightness, warmth)
     local set_brightness = true
     local set_warmth = true
@@ -65,24 +66,22 @@ function SysfsLight:setNaturalBrightness(brightness, warmth)
         warmth = self.current_warmth
     end
 
-    -- Newer devices use a mixer instead of writting values per color.
+    -- Newer devices use a mixer instead of writing values per color.
     if self.frontlight_mixer then
-        -- Honor the device's scale, which may not be [0...100] (e.g., it's [0...10] on the Forma) ;).
-        warmth = math.floor(warmth / self.nl_max)
         if set_brightness then
             -- Prefer the ioctl, as it's much lower latency.
             if self.frontlight_ioctl then
                 self.frontlight_ioctl:setBrightness(brightness)
             else
-                self:_write_value(self.frontlight_white, brightness)
+                ffiUtil.writeToSysfs(brightness, self.frontlight_white)
             end
         end
-        -- And it may be inverted... (cold is nl_max, warm is nl_min)
+        -- The mixer might be using inverted values... (cold is nl_max, warm is nl_min)
         if set_warmth then
             if self.nl_inverted then
-                self:_write_value(self.frontlight_mixer, self.nl_max - warmth)
+                ffiUtil.writeToSysfs(self.nl_max - warmth, self.frontlight_mixer)
             else
-                self:_write_value(self.frontlight_mixer, warmth)
+                ffiUtil.writeToSysfs(warmth, self.frontlight_mixer)
             end
         end
     else
@@ -92,14 +91,12 @@ function SysfsLight:setNaturalBrightness(brightness, warmth)
         if brightness > 0 then
             -- On Nickel, the values for white/red/green are roughly linearly dependent
             -- on the 4th root of brightness and warmth.
-            white = math.min(self.white_gain * math.pow(brightness, self.exponent) *
-                             math.pow(100 - warmth, self.exponent) + self.white_offset, 255)
+            white = math.min(self.white_gain * (brightness * (100 - warmth))^self.exponent + self.white_offset, 255)
         end
         if warmth > 0 then
-            red = math.min(self.red_gain * math.pow(brightness, self.exponent) *
-                           math.pow(warmth, self.exponent) + self.red_offset, 255)
-            green = math.min(self.green_gain * math.pow(brightness, self.exponent) *
-                             math.pow(warmth, self.exponent) + self.green_offset, 255)
+            local brightness_warmth_exp = (brightness * warmth)^self.exponent
+            red = math.min(self.red_gain * brightness_warmth_exp + self.red_offset, 255)
+            green = math.min(self.green_gain * brightness_warmth_exp + self.green_offset, 255)
         end
 
         white = math.max(white, 0)
@@ -127,26 +124,11 @@ function SysfsLight:_set_light_value(sysfs_directory, value)
     if not sysfs_directory then return end
     -- bl_power is '31' when the light is turned on, '0' otherwise.
     if (value > 0) then
-        self:_write_value(sysfs_directory .. "/bl_power", 31)
+        ffiUtil.writeToSysfs(31, sysfs_directory .. "/bl_power")
     else
-        self:_write_value(sysfs_directory .. "/bl_power", 0)
+        ffiUtil.writeToSysfs(0, sysfs_directory .. "/bl_power")
     end
-    self:_write_value(sysfs_directory .. "/brightness", value)
-end
-
-function SysfsLight:_write_value(file, value)
-    local f = io.open(file, "w")
-    if not f then
-        logger.err("Could not open file: ", file)
-        return false
-    end
-    local ret, err_msg, err_code = f:write(value)
-    io.close(f)
-    if not ret then
-        logger.err("Write error: ", err_msg, err_code)
-        return false
-    end
-    return true
+    ffiUtil.writeToSysfs(value, sysfs_directory .. "/brightness")
 end
 
 return SysfsLight

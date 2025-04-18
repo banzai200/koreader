@@ -30,7 +30,7 @@ Event:new("GotoPage", 1)
 function Event:new(name, ...)
     local o = {
         handler = "on"..name,
-        args = {...}
+        args = table.pack(...),
     }
     setmetatable(o, self)
     self.__index = self

@@ -2,7 +2,7 @@ local Blitbuffer = require("ffi/blitbuffer")
 local Document = require("document/document")
 local DrawContext = require("ffi/drawcontext")
 
-local DjvuDocument = Document:new{
+local DjvuDocument = Document:extend{
     _document = false,
     -- libdjvulibre manages its own additional cache, default value is hard written in c module.
     is_djvu = true,
@@ -25,7 +25,6 @@ local function validDjvuFile(filename)
 end
 
 function DjvuDocument:init()
-    self:updateColorRendering()
     local djvu = require("libs/libkoreader-djvu")
     self.koptinterface = require("document/koptinterface")
     self.koptinterface:setDefaultConfigurable(self.configurable)
@@ -38,9 +37,11 @@ function DjvuDocument:init()
     if not ok then
         error(self._document)  -- will contain error message
     end
+    self:updateColorRendering()
     self.is_open = true
     self.info.has_pages = true
     self.info.configurable = true
+    self.render_mode = 0
     self:_readMetadata()
 end
 
@@ -51,25 +52,16 @@ function DjvuDocument:updateColorRendering()
     end
 end
 
-function DjvuDocument:getProps()
-    local props = self._document:getMetadata()
-    local _, _, docname = self.file:find(".*/(.*)")
-    docname = docname or self.file
-
-    -- According to djvused(1), the convention is that
-    -- BibTex keys are always lowercase and DocInfo capitalized
-    props.title = props.title or props.Title or docname:match("(.*)%.")
-    props.authors = props.author or props.Author
-    props.series = props.series or props.Series
-    props.language = props.language or props.Language
-    props.keywords = props.keywords or props.Keywords
-    props.description = props.description or props.Description
-
-    return props
+function DjvuDocument:comparePositions(pos1, pos2)
+    return self.koptinterface:comparePositions(self, pos1, pos2)
 end
 
 function DjvuDocument:getPageTextBoxes(pageno)
     return self._document:getPageText(pageno)
+end
+
+function DjvuDocument:getPanelFromPage(pageno, pos)
+    return self.koptinterface:getPanelFromPage(self, pageno, pos)
 end
 
 function DjvuDocument:getWordFromPosition(spos)
@@ -86,6 +78,10 @@ end
 
 function DjvuDocument:nativeToPageRectTransform(pageno, rect)
     return self.koptinterface:nativeToPageRectTransform(self, pageno, rect)
+end
+
+function DjvuDocument:getSelectedWordContext(word, nb_words, pos)
+    return self.koptinterface:getSelectedWordContext(word, nb_words, pos)
 end
 
 function DjvuDocument:getOCRWord(pageno, wbox)
@@ -128,25 +124,31 @@ function DjvuDocument:getCoverPageImage()
     return self.koptinterface:getCoverPageImage(self)
 end
 
-function DjvuDocument:findText(pattern, origin, reverse, caseInsensitive, page)
-    return self.koptinterface:findText(self, pattern, origin, reverse, caseInsensitive, page)
+function DjvuDocument:findText(pattern, origin, reverse, case_insensitive, page)
+    return self.koptinterface:findText(self, pattern, origin, reverse, case_insensitive, page)
 end
 
-function DjvuDocument:renderPage(pageno, rect, zoom, rotation, gamma, render_mode)
-    return self.koptinterface:renderPage(self, pageno, rect, zoom, rotation, gamma, render_mode)
+function DjvuDocument:findAllText(pattern, case_insensitive, nb_context_words, max_hits)
+    return self.koptinterface:findAllText(self, pattern, case_insensitive, nb_context_words, max_hits)
 end
 
-function DjvuDocument:hintPage(pageno, zoom, rotation, gamma, render_mode)
-    return self.koptinterface:hintPage(self, pageno, zoom, rotation, gamma, render_mode)
+function DjvuDocument:renderPage(pageno, rect, zoom, rotation, gamma, hinting)
+    return self.koptinterface:renderPage(self, pageno, rect, zoom, rotation, gamma, hinting)
 end
 
-function DjvuDocument:drawPage(target, x, y, rect, pageno, zoom, rotation, gamma, render_mode)
-    return self.koptinterface:drawPage(self, target, x, y, rect, pageno, zoom, rotation, gamma, render_mode)
+function DjvuDocument:hintPage(pageno, zoom, rotation, gamma)
+    return self.koptinterface:hintPage(self, pageno, zoom, rotation, gamma)
+end
+
+function DjvuDocument:drawPage(target, x, y, rect, pageno, zoom, rotation, gamma)
+    return self.koptinterface:drawPage(self, target, x, y, rect, pageno, zoom, rotation, gamma)
 end
 
 function DjvuDocument:register(registry)
-    registry:addProvider("djv", "image/vnd.djvu", self, 100)
     registry:addProvider("djvu", "image/vnd.djvu", self, 100)
+    registry:addProvider("djvu", "application/djvu", self, 100) -- Alternative mimetype for OPDS.
+    registry:addProvider("djvu", "image/x-djvu", self, 100) -- Alternative mimetype for OPDS.
+    registry:addProvider("djv", "image/vnd.djvu", self, 100)
 end
 
 return DjvuDocument

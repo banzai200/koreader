@@ -6,18 +6,18 @@ local BD = require("ui/bidi")
 local WidgetContainer = require("ui/widget/container/widgetcontainer")
 local util = require("util")
 
-local HorizontalGroup = WidgetContainer:new{
+local HorizontalGroup = WidgetContainer:extend{
     align = "center",
     allow_mirroring = true,
-    _mirroredUI = BD.mirroredUILayout(),
     _size = nil,
 }
 
 function HorizontalGroup:getSize()
     if not self._size then
+        local _mirroredUI = BD.mirroredUILayout()
         self._size = { w = 0, h = 0 }
         self._offsets = { }
-        if self._mirroredUI and self.allow_mirroring then
+        if _mirroredUI and self.allow_mirroring then
             util.arrayReverse(self)
         end
         for i, widget in ipairs(self) do
@@ -31,7 +31,7 @@ function HorizontalGroup:getSize()
                 self._size.h = w_size.h
             end
         end
-        if self._mirroredUI and self.allow_mirroring then
+        if _mirroredUI and self.allow_mirroring then
             util.arrayReverse(self)
         end
     end
@@ -40,8 +40,9 @@ end
 
 function HorizontalGroup:paintTo(bb, x, y)
     local size = self:getSize()
+    local _mirroredUI = BD.mirroredUILayout()
 
-    if self._mirroredUI and self.allow_mirroring then
+    if _mirroredUI and self.allow_mirroring then
         util.arrayReverse(self)
     end
     for i, widget in ipairs(self) do
@@ -58,14 +59,15 @@ function HorizontalGroup:paintTo(bb, x, y)
                             self.align)
         end
     end
-    if self._mirroredUI and self.allow_mirroring then
+    if _mirroredUI and self.allow_mirroring then
         util.arrayReverse(self)
     end
 end
 
 function HorizontalGroup:clear()
     self:free()
-    WidgetContainer.clear(self)
+    -- Skip WidgetContainer:clear's free call, we just did that in our own free ;)
+    WidgetContainer.clear(self, true)
 end
 
 function HorizontalGroup:resetLayout()
@@ -74,6 +76,7 @@ function HorizontalGroup:resetLayout()
 end
 
 function HorizontalGroup:free()
+    --print("HorizontalGroup:free on", self)
     self:resetLayout()
     WidgetContainer.free(self)
 end

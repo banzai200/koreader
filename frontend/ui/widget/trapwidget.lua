@@ -25,7 +25,7 @@ local UIManager = require("ui/uimanager")
 local Input = Device.input
 local Screen = Device.screen
 
-local TrapWidget = InputContainer:new{
+local TrapWidget = InputContainer:extend{
     modal = true,
     dismiss_callback = function() end,
     text = nil, -- will be invisible if no message given
@@ -41,20 +41,22 @@ function TrapWidget:init()
         h = Screen:getHeight(),
     }
     if Device:hasKeys() then
-        self.key_events = {
-            AnyKeyPressed = { { Input.group.Any },
-                seqtext = "any key", doc = "dismiss" }
-        }
+        self.key_events.AnyKeyPressed = { { Input.group.Any } }
     end
     if Device:isTouchDevice() then
-        self.ges_events.TapDismiss = {
-            GestureRange:new{ ges = "tap", range = full_screen, }
-        }
-        self.ges_events.HoldDismiss = {
-            GestureRange:new{ ges = "hold", range = full_screen, }
-        }
-        self.ges_events.SwipeDismiss = {
-            GestureRange:new{ ges = "swipe", range = full_screen, }
+        self.ges_events = {
+            TapDismiss = {
+                GestureRange:new{ ges = "tap", range = full_screen, }
+            },
+            HoldDismiss = {
+                GestureRange:new{ ges = "hold", range = full_screen, }
+            },
+            SwipeDismiss = {
+                GestureRange:new{ ges = "swipe", range = full_screen, }
+            },
+            PanReleaseDismiss = { -- emitted on mousewheel event
+                GestureRange:new{ ges = "pan_release", range = full_screen, }
+            },
         }
     end
     if self.text then
@@ -108,14 +110,14 @@ function TrapWidget:init()
     end
 end
 
-function TrapWidget:_dismissAndResent(evtype, ev)
+function TrapWidget:_dismissAndResend(evtype, ev)
     self.dismiss_callback()
     UIManager:close(self)
     if self.resend_event and evtype and ev then
         -- There may be some timing issues that could cause crashes, as we
         -- use nextTick, if the dismiss_callback uses UIManager:scheduleIn()
         -- or has set up some widget that may catch that event while not being
-        -- yet fully initialiazed.
+        -- yet fully initialized.
         -- (It happened mostly when I had some bug somewhere, and it was a quite
         -- reliable sign of a bug somewhere, but the stacktrace was unrelated
         -- to the bug location.)
@@ -125,19 +127,23 @@ function TrapWidget:_dismissAndResent(evtype, ev)
 end
 
 function TrapWidget:onAnyKeyPressed(_, ev)
-    return self:_dismissAndResent("KeyPress", ev)
+    return self:_dismissAndResend("KeyPress", ev)
 end
 
 function TrapWidget:onTapDismiss(_, ev)
-    return self:_dismissAndResent("Gesture", ev)
+    return self:_dismissAndResend("Gesture", ev)
 end
 
 function TrapWidget:onHoldDismiss(_, ev)
-    return self:_dismissAndResent("Gesture", ev)
+    return self:_dismissAndResend("Gesture", ev)
 end
 
 function TrapWidget:onSwipeDismiss(_, ev)
-    return self:_dismissAndResent("Gesture", ev)
+    return self:_dismissAndResend("Gesture", ev)
+end
+
+function TrapWidget:onPanReleaseDismiss(_, ev)
+    return self:_dismissAndResend("Gesture", ev)
 end
 
 function TrapWidget:onShow()
@@ -155,7 +161,6 @@ function TrapWidget:onCloseWidget()
             return "ui", self.frame.dimen
         end)
     end
-    return true
 end
 
 return TrapWidget

@@ -1,13 +1,16 @@
 local ConfirmBox = require("ui/widget/confirmbox")
 local DataStorage = require("datastorage")
+local Dispatcher = require("dispatcher")
 local KeyValuePage = require("ui/widget/keyvaluepage")
 local LuaSettings = require("luasettings")
 local PowerD = require("device"):getPowerDevice()
 local UIManager = require("ui/uimanager")
 local WidgetContainer = require("ui/widget/container/widgetcontainer")
+local datetime = require("datetime")
 local dbg = require("dbg")
-local util = require("util")
+local time = require("ui/time")
 local _ = require("gettext")
+local T = require("ffi/util").template
 
 local State = {}
 
@@ -17,13 +20,13 @@ function State:new(o)
     self.__index = self
     if o.percentage == nil or o.timestamp == nil then
         o.percentage = PowerD:getCapacityHW()
-        o.timestamp = os.time()
+        o.timestamp = time.boottime_or_realtime_coarse()
     end
     return o
 end
 
 function State:toString()
-    return string.format("{%d @ %s}", self.percentage, os.date("%c", self.timestamp))
+    return string.format("{%d @ %s}", self.percentage, os.date("%c", time.to_s(self.timestamp)))
 end
 
 local Usage = {}
@@ -43,54 +46,57 @@ end
 function Usage:append(state)
     local curr = State:new()
     self.percentage = self.percentage + math.abs(state.percentage - curr.percentage)
-    self.time = self.time + os.difftime(curr.timestamp - state.timestamp)
+    self.time = self.time + curr.timestamp - state.timestamp
 end
 
-function Usage:minutes()
-    return self.time / 60
-end
-
-function Usage:hours()
-    return self:minutes() / 60
-end
-
-function Usage:percentagePerHour()
+function Usage:percentageRate()
     if self.time == 0 then
         return 0
     else
-        return self.percentage / self:hours()
+        return self.percentage / time.to_s(self.time)
     end
 end
 
-function Usage:remainingHours()
-    if self:percentagePerHour() == 0 then return "n/a" end
-    local curr = State:new()
-    return curr.percentage / self:percentagePerHour()
+function Usage:percentageRatePerHour()
+    return self:percentageRate() * 3600
 end
 
-function Usage:chargingHours()
-    if self:percentagePerHour() == 0 then return "n/a" end
+function Usage:remainingTime()
+    if self:percentageRate() == 0 then return "N/A" end
     local curr = State:new()
-    return math.abs(curr.percentage - 100) / self:percentagePerHour()
+    return curr.percentage / self:percentageRate()
+end
+
+function Usage:chargingTime()
+    if self:percentageRate() == 0 then return "N/A" end
+    local curr = State:new()
+    return math.abs(curr.percentage - 100) / self:percentageRate()
 end
 
 local function shorten(number)
-    if number == "n/a" then return _("n/a") end
-    return string.format("%.2f", number);
+    if number == "N/A" then return _("N/A") end
+    return string.format("%.2f%%", number)
 end
 
-function Usage:dump(kv_pairs)
-    table.insert(kv_pairs, {INDENTATION .. _("Consumed %"), shorten(self.percentage)})
-    table.insert(kv_pairs, {INDENTATION .. _("Total time"), util.secondsToHClock(self.time, true, true)})
-    table.insert(kv_pairs, {INDENTATION .. _("% per hour"), shorten(self:percentagePerHour())})
+local function duration(number)
+    local duration_fmt = G_reader_settings:readSetting("duration_format", "classic")
+    return type(number) ~= "number" and number or
+        datetime.secondsToClockDuration(duration_fmt, number, true, true)
+end
+
+function Usage:dump(kv_pairs, id)
+    local name = id or _("Consumed:")
+    table.insert(kv_pairs, {INDENTATION .. _("Total time:"), duration(time.to_s(self.time)) })
+    table.insert(kv_pairs, {INDENTATION .. name, shorten(self.percentage), "%"})
+    table.insert(kv_pairs, {INDENTATION .. _("Change per hour:"), shorten(self:percentageRatePerHour())})
 end
 
 function Usage:dumpRemaining(kv_pairs)
-    table.insert(kv_pairs, {INDENTATION .. _("Estimated remaining hours"), shorten(self:remainingHours())})
+    table.insert(kv_pairs, {INDENTATION .. _("Estimated remaining time:"), duration(self:remainingTime())})
 end
 
 function Usage:dumpCharging(kv_pairs)
-    table.insert(kv_pairs, {INDENTATION .. _("Estimated hours for charging"), shorten(self:chargingHours())})
+    table.insert(kv_pairs, {INDENTATION .. _("Estimated time for charging:"), duration(self:chargingTime())})
 end
 
 local BatteryStat = {
@@ -198,15 +204,8 @@ function BatteryStat:showStatistics()
 
     self:accumulate()
     local kv_pairs = self:dump()
-    table.insert(kv_pairs, "----------")
-    table.insert(kv_pairs, {_("If you would like to reset the data,"), "",
-                            callback = function()
-                                UIManager:setDirty(self.kv_page, "fast")
-                                UIManager:scheduleIn(0.1, function()
-                                    askResetData()
-                                end)
-                            end})
-    table.insert(kv_pairs, {_("please tap here."), "",
+    kv_pairs[#kv_pairs].separator = true
+    table.insert(kv_pairs, {_("Tap to reset the data."), "",
                             callback = function()
                                 UIManager:setDirty(self.kv_page, "fast")
                                 UIManager:scheduleIn(0.1, function()
@@ -214,8 +213,9 @@ function BatteryStat:showStatistics()
                                 end)
                             end})
     self.kv_page = KeyValuePage:new{
-        title = _("Battery statistics"),
+        title = T(_("Battery statistics (now %1%)"), self.awake_state.percentage),
         kv_pairs = kv_pairs,
+        single_page = true,
     }
     UIManager:show(self.kv_page)
 end
@@ -254,7 +254,7 @@ function BatteryStat:dump()
     self.sleeping:dump(kv_pairs)
     self.sleeping:dumpRemaining(kv_pairs)
     table.insert(kv_pairs, {_("During last charge"), ""})
-    self.charging:dump(kv_pairs)
+    self.charging:dump(kv_pairs, _("Charged:"))
     self.charging:dumpCharging(kv_pairs)
     table.insert(kv_pairs, {_("Since last charge"), ""})
     self.discharging:dump(kv_pairs)
@@ -264,13 +264,18 @@ end
 
 BatteryStat:init()
 
-local BatteryStatWidget = WidgetContainer:new{
+local BatteryStatWidget = WidgetContainer:extend{
     name = "batterystat",
 }
+
+function BatteryStatWidget:onDispatcherRegisterActions()
+    Dispatcher:registerAction("battery_statistics", {category="none", event="ShowBatteryStatistics", title=_("Battery statistics"), device=true, separator=true})
+end
 
 function BatteryStatWidget:init()
     -- self.ui is nil in test cases.
     if not self.ui or not self.ui.menu then return end
+    self:onDispatcherRegisterActions()
     self.ui.menu:registerToMainMenu(self)
 end
 
@@ -282,6 +287,10 @@ function BatteryStatWidget:addToMainMenu(menu_items)
             BatteryStat:showStatistics()
         end,
     }
+end
+
+function BatteryStatWidget:onShowBatteryStatistics()
+    BatteryStat:showStatistics()
 end
 
 function BatteryStatWidget:onFlushSettings()

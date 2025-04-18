@@ -17,7 +17,7 @@ local logger = require("logger")
 local util = require("util")
 local Screen = Device.screen
 
-local PhysicalNumericKey = WidgetContainer:new{
+local PhysicalNumericKey = WidgetContainer:extend{
     key = nil,
     label = nil,
     physical_key_label = nil,
@@ -60,6 +60,8 @@ function PhysicalNumericKey:init()
         },
     }
     self.dimen = Geom:new{
+        x = 0,
+        y = 0,
         w = self.width,
         h = self.height,
     }
@@ -67,7 +69,7 @@ end
 
 -- start of PhysicalKeyboard
 
-local PhysicalKeyboard = InputContainer:new{
+local PhysicalKeyboard = InputContainer:extend{
     is_always_active = true,
     inputbox = nil,  -- expect ui/widget/inputtext instance
     bordersize = Size.border.button,
@@ -81,11 +83,9 @@ function PhysicalKeyboard:init()
     for _,row in ipairs(Device.keyboard_layout) do
         util.arrayAppend(all_keys, row)
     end
-    self.key_events = {
-        KeyPress = { { all_keys }, }
-    }
+    self.key_events.KeyPress = { { all_keys } }
 
-    self.dimen = Geom:new{ w = 0, h = 0 }
+    self.dimen = Geom:new{ x = 0, y = 0, w = 0, h = 0 }
 
     self:setType(self.inputbox.input_type)
 end
@@ -168,5 +168,12 @@ function PhysicalKeyboard:setupNumericMappingUI()
 
     self.dimen = keyboard_frame:getSize()
 end
+
+-- Match VirtualKeyboard's API to ease caller's life
+function PhysicalKeyboard:lockVisibility() end
+function PhysicalKeyboard:setVisibility() end
+function PhysicalKeyboard:isVisible() return true end
+function PhysicalKeyboard:showKeyboard() end
+function PhysicalKeyboard:hideKeyboard() end
 
 return PhysicalKeyboard

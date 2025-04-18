@@ -13,7 +13,7 @@ only 2 valid combinations:
 
 Text direction is handled by the libkoreader-xtext.so C module,
 and the TextWidget and TextBoxWidget widgets that handle text
-aligment. We just need here to set the default global paragraph
+alignment. We just need here to set the default global paragraph
 direction (that widgets can override if needed).
 
 UI mirroring is to be handled by our widget themselves, with the
@@ -43,6 +43,7 @@ local _ = require("gettext")
 local Bidi = {
     _mirrored_ui_layout = false,
     _rtl_ui_text = false,
+    _inverted = false,
 }
 
 -- Setup UI mirroring and RTL text for UI language
@@ -61,7 +62,7 @@ function Bidi.setup(lang)
         -- Text direction should normally not follow ui mirroring
         -- lang override (so that Arabic is still right aligned
         -- when one wants the UI layout LTR). But allow it to
-        -- be independantly reversed (for testing UI mirroring
+        -- be independently reversed (for testing UI mirroring
         -- with english text right aligned).
         if G_reader_settings:isTrue("dev_reverse_ui_text_direction") then
             is_rtl = not is_rtl
@@ -126,6 +127,22 @@ function Bidi.mirroredUILayout()
     return Bidi._mirrored_ui_layout
 end
 
+-- This function can be used by document widgets to temporarily match a widget
+-- to the document page turn direction instead of the UI layout direction.
+function Bidi.invert()
+    if not Bidi._inverted then
+        Bidi._mirrored_ui_layout = not Bidi._mirrored_ui_layout
+        Bidi._inverted = true
+    end
+end
+
+function Bidi.resetInvert()
+    if Bidi._inverted then
+        Bidi._mirrored_ui_layout = not Bidi._mirrored_ui_layout
+        Bidi._inverted = false
+    end
+end
+
 -- This function might only be useful in some rare cases (RTL text
 -- is handled directly by TextWidget and TextBoxWidget)
 function Bidi.rtlUIText()
@@ -170,14 +187,14 @@ end
 -- which would be an issue and would need stripping. But as these
 -- Free fonts are only used as fallback fonts, and the invisible glyphs
 -- will have been found in the previous fonts, we don't need to.
-local LRI = "\xE2\x81\xA6"     -- U+2066 LRI / LEFT-TO-RIGHT ISOLATE
-local RLI = "\xE2\x81\xA7"     -- U+2067 RLI / RIGHT-TO-LEFT ISOLATE
-local FSI = "\xE2\x81\xA8"     -- U+2068 FSI / FIRST STRONG ISOLATE
-local PDI = "\xE2\x81\xA9"     -- U+2069 PDI / POP DIRECTIONAL ISOLATE
+local LRI = "\u{2066}"     -- LRI / LEFT-TO-RIGHT ISOLATE
+local RLI = "\u{2067}"     -- RLI / RIGHT-TO-LEFT ISOLATE
+local FSI = "\u{2068}"     -- FSI / FIRST STRONG ISOLATE
+local PDI = "\u{2069}"     -- PDI / POP DIRECTIONAL ISOLATE
 
 -- Not currently needed:
--- local LRM = "\xE2\x80\x8E"     -- U+200E LRM / LEFT-TO-RIGHT MARK
--- local RLM = "\xE2\x80\x8F"     -- U+200F RLM / RIGHT-TO-LEFT MARK
+-- local LRM = "\u{200E}"     -- LRM / LEFT-TO-RIGHT MARK
+-- local RLM = "\u{200F}"     -- RLM / RIGHT-TO-LEFT MARK
 
 function Bidi.ltr(text)
     return string.format("%s%s%s", LRI, text, PDI)

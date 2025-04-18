@@ -17,7 +17,7 @@ Example:
                 background = Blitbuffer.COLOR_WHITE,
                 TextWidget:new{
                     text = "foo",
-                    fact = Font:getFace("cfont"),
+                    face = Font:getFace("cfont"),
                 }
             },
             FrameContainer:new{
@@ -25,7 +25,7 @@ Example:
                 background = Blitbuffer.COLOR_LIGHT_GRAY,
                 TextWidget:new{
                     text = "bar",
-                    fact = Font:getFace("cfont"),
+                    face = Font:getFace("cfont"),
                 }
             },
             -- You can add as many widgets as you want here...
@@ -46,19 +46,19 @@ local InputContainer = require("ui/widget/container/inputcontainer")
 local Size = require("ui/size")
 local VerticalGroup = require("ui/widget/verticalgroup")
 
-local ListView = InputContainer:new{
+local ListView = InputContainer:extend{
     width = nil,
     height = nil,
     padding = nil,
     item_height = nil,
-    itmes = nil,
+    items = nil,
 }
 
 function ListView:init()
     if #self.items <= 0 then return end
 
     self.show_page = 1
-    self.dimen = Geom:new{w = self.width, h = self.height}
+    self.dimen = Geom:new{x = 0, y = 0, w = self.width, h = self.height}
 
     if Device:isTouchDevice() then
         self.ges_events.Swipe = {

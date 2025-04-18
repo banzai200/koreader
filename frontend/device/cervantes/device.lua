@@ -1,5 +1,4 @@
 local Generic = require("device/generic/device")
-local TimeVal = require("ui/timeval")
 local logger = require("logger")
 
 local function yes() return true end
@@ -8,36 +7,9 @@ local function no() return false end
 local function getProductId()
     local ntxinfo_pcb = io.popen("/usr/bin/ntxinfo /dev/mmcblk0 | grep pcb | cut -d ':' -f2", "r")
     if not ntxinfo_pcb then return 0 end
-    local product_id = tonumber(ntxinfo_pcb:read()) or 0
+    local product_id = ntxinfo_pcb:read("*number") or 0
     ntxinfo_pcb:close()
     return product_id
-end
-
-local function isConnected()
-    -- read carrier state from sysfs (for eth0)
-    local file = io.open("/sys/class/net/eth0/carrier", "rb")
-
-    -- file exists while wifi module is loaded.
-    if not file then return 0 end
-
-    -- 0 means not connected, 1 connected
-    local out = file:read("*all")
-    file:close()
-
-    -- strip NaN from file read (ie: line endings, error messages)
-    local carrier
-    if type(out) ~= "number" then
-        carrier = tonumber(out)
-    else
-        carrier = out
-    end
-
-    -- finally return if we're connected or not
-    if type(carrier) == "number" then
-        return carrier
-    else
-        return 0
-    end
 end
 
 local function isMassStorageSupported()
@@ -48,20 +20,25 @@ local function isMassStorageSupported()
     return true
 end
 
-local Cervantes = Generic:new{
+local Cervantes = Generic:extend{
     model = "Cervantes",
+    ota_model = "cervantes",
     isCervantes = yes,
     isAlwaysPortrait = yes,
     isTouchDevice = yes,
     touch_legacy = true, -- SingleTouch input events
     touch_switch_xy = true,
     touch_mirrored_x = true,
-    touch_probe_ev_epoch_time = true,
     hasOTAUpdates = yes,
+    hasFastWifiStatusQuery = yes,
     hasKeys = yes,
     hasWifiManager = yes,
+    hasWifiRestore = yes,
     canReboot = yes,
     canPowerOff = yes,
+    canSuspend = yes,
+    supportsScreensaver = yes,
+    home_dir = "/mnt/public",
 
     -- do we support usb mass storage?
     canToggleMassStorage = function() return isMassStorageSupported() end,
@@ -77,33 +54,33 @@ local Cervantes = Generic:new{
     canHWInvert = yes,
 }
 -- Cervantes Touch
-local CervantesTouch = Cervantes:new{
+local CervantesTouch = Cervantes:extend{
     model = "CervantesTouch",
     display_dpi = 167,
     hasFrontlight = no,
     hasMultitouch = no,
 }
 -- Cervantes TouchLight / Fnac Touch Plus
-local CervantesTouchLight = Cervantes:new{
+local CervantesTouchLight = Cervantes:extend{
     model = "CervantesTouchLight",
     display_dpi = 167,
     hasMultitouch = no,
 }
 -- Cervantes 2013 / Fnac Touch Light
-local Cervantes2013 = Cervantes:new{
+local Cervantes2013 = Cervantes:extend{
     model = "Cervantes2013",
     display_dpi = 212,
     hasMultitouch = no,
     --- @fixme: Possibly requires canHWInvert = no, as it seems to be based on a similar board as the Kobo Aura...
 }
 -- Cervantes 3 / Fnac Touch Light 2
-local Cervantes3 = Cervantes:new{
+local Cervantes3 = Cervantes:extend{
     model = "Cervantes3",
     display_dpi = 300,
     hasMultitouch = no,
 }
 -- Cervantes 4
-local Cervantes4 = Cervantes:new{
+local Cervantes4 = Cervantes:extend{
     model = "Cervantes4",
     display_dpi = 300,
     hasNaturalLight = yes,
@@ -117,37 +94,12 @@ local Cervantes4 = Cervantes:new{
 }
 
 -- input events
-local probeEvEpochTime
--- this function will update itself after the first touch event
-probeEvEpochTime = function(self, ev)
-    local now = TimeVal:now()
-    -- This check should work as long as main UI loop is not blocked for more
-    -- than 10 minute before handling the first touch event.
-    if ev.time.sec <= now.sec - 600 then
-        -- time is seconds since boot, force it to epoch
-        probeEvEpochTime = function(_, _ev)
-            _ev.time = TimeVal:now()
-        end
-        ev.time = now
-    else
-        -- time is already epoch time, no need to do anything
-        probeEvEpochTime = function(_, _) end
-    end
-end
 function Cervantes:initEventAdjustHooks()
-    if self.touch_switch_xy then
-        self.input:registerEventAdjustHook(self.input.adjustTouchSwitchXY)
-    end
-    if self.touch_mirrored_x then
+    if self.touch_switch_xy and self.touch_mirrored_x then
         self.input:registerEventAdjustHook(
-            self.input.adjustTouchMirrorX,
-            self.screen:getWidth()
+            self.input.adjustTouchSwitchAxesAndMirrorX,
+            (self.screen:getWidth() - 1)
         )
-    end
-    if self.touch_probe_ev_epoch_time then
-        self.input:registerEventAdjustHook(function(_, ev)
-            probeEvEpochTime(_, ev)
-        end)
     end
 
     if self.touch_legacy then
@@ -155,30 +107,8 @@ function Cervantes:initEventAdjustHooks()
     end
 end
 
--- Make sure the C BB cannot be used on devices with unsafe HW inversion, as otherwise NightMode would be ineffective.
-function Cervantes:blacklistCBB()
-    local ffi = require("ffi")
-    local dummy = require("ffi/posix_h")
-    local C = ffi.C
-
-    -- NOTE: canUseCBB is never no on Cervantes ;).
-    if not self:canUseCBB() or not self:canHWInvert() then
-        logger.info("Blacklisting the C BB on this device")
-        if ffi.os == "Windows" then
-            C._putenv("KO_NO_CBB=true")
-        else
-            C.setenv("KO_NO_CBB", "true", 1)
-        end
-        -- Enforce the global setting, too, so the Dev menu is accurate...
-        G_reader_settings:saveSetting("dev_no_c_blitter", true)
-    end
-end
-
 function Cervantes:init()
-    -- Blacklist the C BB before the first BB require...
-    self:blacklistCBB()
-
-    self.screen = require("ffi/framebuffer_mxcfb"):new{device = self, debug = logger.dbg}
+    self.screen = require("ffi/framebuffer_mxcfb"):new{device = self, debug = logger.dbg, is_always_portrait = self.isAlwaysPortrait()}
 
     -- Automagically set this so we never have to remember to do it manually ;p
     if self:hasNaturalLight() and self.frontlight_settings and self.frontlight_settings.frontlight_mixer then
@@ -193,9 +123,9 @@ function Cervantes:init()
             [116] = "Power",
         }
     }
-    self.input.open("/dev/input/event0") -- Keys
-    self.input.open("/dev/input/event1") -- touchscreen
-    self.input.open("fake_events") -- usb events
+    self.input:open("/dev/input/event0") -- Keys
+    self.input:open("/dev/input/event1") -- touchscreen
+    self.input:open("fake_events") -- usb events
     self:initEventAdjustHooks()
     Generic.init(self)
 end
@@ -223,17 +153,20 @@ end
 -- wireless
 function Cervantes:initNetworkManager(NetworkMgr)
     function NetworkMgr:turnOffWifi(complete_callback)
-        logger.info("Cervantes: disabling WiFi")
+        logger.info("Cervantes: disabling Wi-Fi")
         self:releaseIP()
         os.execute("./disable-wifi.sh")
         if complete_callback then
             complete_callback()
         end
     end
-    function NetworkMgr:turnOnWifi(complete_callback)
-        logger.info("Cervantes: enabling WiFi")
+    function NetworkMgr:turnOnWifi(complete_callback, interactive)
+        logger.info("Cervantes: enabling Wi-Fi")
         os.execute("./enable-wifi.sh")
-        self:reconnectOrShowNetworkMenu(complete_callback)
+        return self:reconnectOrShowNetworkMenu(complete_callback, interactive)
+    end
+    function NetworkMgr:getNetworkInterfaceName()
+        return "eth0"
     end
     NetworkMgr:setWirelessBackend("wpa_supplicant", {ctrl_interface = "/var/run/wpa_supplicant/eth0"})
     function NetworkMgr:obtainIP()
@@ -245,32 +178,8 @@ function Cervantes:initNetworkManager(NetworkMgr)
     function NetworkMgr:restoreWifiAsync()
         os.execute("./restore-wifi-async.sh")
     end
-    function NetworkMgr:isWifiOn()
-        return 1 == isConnected()
-    end
-end
-
--- screensaver
-function Cervantes:supportsScreensaver()
-    return true
-end
-function Cervantes:intoScreenSaver()
-    local Screensaver = require("ui/screensaver")
-    if self.screen_saver_mode == false then
-        Screensaver:show()
-    end
-    self.powerd:beforeSuspend()
-    self.screen_saver_mode = true
-end
-function Cervantes:outofScreenSaver()
-    if self.screen_saver_mode == true then
-        local Screensaver = require("ui/screensaver")
-        Screensaver:close()
-        local UIManager = require("ui/uimanager")
-        UIManager:nextTick(function() UIManager:setDirty("all", "full") end)
-    end
-    self.powerd:afterResume()
-    self.screen_saver_mode = false
+    NetworkMgr.isWifiOn = NetworkMgr.sysfsWifiOn
+    NetworkMgr.isConnected = NetworkMgr.ifHasAnAddress
 end
 
 -- power functions: suspend, resume, reboot, poweroff
@@ -281,10 +190,86 @@ function Cervantes:resume()
     os.execute("./resume.sh")
 end
 function Cervantes:reboot()
-    os.execute("reboot")
+    os.execute("sleep 1 && reboot &")
 end
 function Cervantes:powerOff()
-    os.execute("halt")
+    os.execute("sleep 1 && halt &")
+end
+
+-- This method is the same as the one in kobo/device.lua except the sleep cover part.
+function Cervantes:setEventHandlers(UIManager)
+    -- We do not want auto suspend procedure to waste battery during
+    -- suspend. So let's unschedule it when suspending, and restart it after
+    -- resume. Done via the plugin's onSuspend/onResume handlers.
+    UIManager.event_handlers.Suspend = function()
+        self:onPowerEvent("Suspend")
+    end
+    UIManager.event_handlers.Resume = function()
+        self:onPowerEvent("Resume")
+    end
+    UIManager.event_handlers.PowerPress = function()
+        -- Always schedule power off.
+        -- Press the power button for 2+ seconds to shutdown directly from suspend.
+        UIManager:scheduleIn(2, UIManager.poweroff_action)
+    end
+    UIManager.event_handlers.PowerRelease = function()
+        if not UIManager._entered_poweroff_stage then
+            UIManager:unschedule(UIManager.poweroff_action)
+            -- resume if we were suspended
+            if self.screen_saver_mode then
+                if self.screen_saver_lock then
+                    UIManager.event_handlers.Suspend()
+                else
+                    UIManager.event_handlers.Resume()
+                end
+            else
+                UIManager.event_handlers.Suspend()
+            end
+        end
+    end
+    UIManager.event_handlers.Light = function()
+        self:getPowerDevice():toggleFrontlight()
+    end
+    -- USB plug events with a power-only charger
+    UIManager.event_handlers.Charging = function()
+        self:_beforeCharging()
+        -- NOTE: Plug/unplug events will wake the device up, which is why we put it back to sleep.
+        if self.screen_saver_mode and not self.screen_saver_lock then
+           UIManager.event_handlers.Suspend()
+        end
+    end
+    UIManager.event_handlers.NotCharging = function()
+        -- We need to put the device into suspension, other things need to be done before it.
+        self:usbPlugOut()
+        self:_afterNotCharging()
+        if self.screen_saver_mode and not self.screen_saver_lock then
+           UIManager.event_handlers.Suspend()
+        end
+    end
+    -- USB plug events with a data-aware host
+    UIManager.event_handlers.UsbPlugIn = function()
+        self:_beforeCharging()
+        -- NOTE: Plug/unplug events will wake the device up, which is why we put it back to sleep.
+        if self.screen_saver_mode and not self.screen_saver_lock then
+            UIManager.event_handlers.Suspend()
+        elseif not self.screen_saver_lock then
+            -- Potentially start an USBMS session
+            local MassStorage = require("ui/elements/mass_storage")
+            MassStorage:start()
+        end
+    end
+    UIManager.event_handlers.UsbPlugOut = function()
+        -- We need to put the device into suspension, other things need to be done before it.
+        self:usbPlugOut()
+        self:_afterNotCharging()
+        if self.screen_saver_mode and not self.screen_saver_lock then
+            UIManager.event_handlers.Suspend()
+        elseif not self.screen_saver_lock then
+            -- Potentially dismiss the USBMS ConfirmBox
+            local MassStorage = require("ui/elements/mass_storage")
+            MassStorage:dismiss()
+        end
+    end
 end
 
 -------------- device probe ------------

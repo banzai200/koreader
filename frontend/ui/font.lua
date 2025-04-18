@@ -6,6 +6,7 @@ local FontList = require("fontlist")
 local Freetype = require("ffi/freetype")
 local Screen = require("device").screen
 local logger = require("logger")
+local util = require("util")
 
 -- Known regular (and italic) fonts with an available bold font file
 local _bold_font_variant = {}
@@ -28,11 +29,11 @@ local Font = {
     regular_font_variant = _regular_font_variant,
 
     -- Allow globally not promoting fonts to their bold variants
-    -- (and use thiner and narrower synthetized bold instead).
+    -- (and use thinner and narrower synthesized bold instead).
     use_bold_font_for_bold = G_reader_settings:nilOrTrue("use_bold_font_for_bold"),
 
     -- Widgets can provide "bold = Font.FORCE_SYNTHETIZED_BOLD" instead
-    -- of "bold = true" to explicitely request synthetized bold, which,
+    -- of "bold = true" to explicitly request synthesized bold, which,
     -- with XText, makes a bold string the same width as itself non-bold.
     FORCE_SYNTHETIZED_BOLD = "FORCE_SYNTHETIZED_BOLD",
 
@@ -109,16 +110,65 @@ local Font = {
         [2] = "NotoSansCJKsc-Regular.otf",
         [3] = "NotoSansArabicUI-Regular.ttf",
         [4] = "NotoSansDevanagariUI-Regular.ttf",
-        [5] = "nerdfonts/symbols.ttf",
-        [6] = "freefont/FreeSans.ttf",
-        [7] = "freefont/FreeSerif.ttf",
+        [5] = "NotoSansBengaliUI-Regular.ttf",
+        [6] = "nerdfonts/symbols.ttf",
+        [7] = "freefont/FreeSans.ttf",
+        [8] = "freefont/FreeSerif.ttf",
     },
+    -- Additional fallback fonts are managed by frontend/ui/elements/font_ui_fallbacks.lua
+    -- Add any after NotoSansCJKsc (because CJKsc has better symbols, and has 'locl' OTF
+    -- features to support all of SC, TC, JA and KO that other CJK fonts may not have.)
+    additional_fallback_insert_indice = 3,
+    -- Xtext supports up to 15 fallback fonts, but keep some slots free and available for
+    -- future additions to our hardcoded fallbacks list above, and to not slow down
+    -- rendering with too many fallback fonts.
+    additional_fallback_max_nb = 4,
 
     -- face table
     faces = {},
 }
 
--- Helper functions with explicite names around
+if G_reader_settings and G_reader_settings:has("font_ui_fallbacks") then
+    local additional_fallbacks = G_reader_settings:readSetting("font_ui_fallbacks")
+    for i=#additional_fallbacks, 1, -1 do
+        table.insert(Font.fallbacks, Font.additional_fallback_insert_indice, additional_fallbacks[i])
+    end
+    logger.dbg("updated Font.fallbacks:", Font.fallbacks)
+end
+
+-- We don't ship a bold variant for some of our fallback fonts.
+-- Allow users themselves to drop a Noto Sans Bold variant of their most used fallbacks,
+-- and we will use them if present.
+-- Match bold font to fallback by name. We do not use FontInfo name match
+-- to allow users more flexibility.
+-- Because the hardcoded fallback fonts' paths are their filenames not actual paths,
+-- we need to match with filenames rather than paths
+local bold_candidates = {} -- key: bold font's name, value: corresponding regular font's path
+for _, fallback_font_path in ipairs(Font.fallbacks) do
+    local _, font_name = util.splitFilePathName(fallback_font_path)
+    if font_name and not _bold_font_variant[fallback_font_path]
+                 and not _bold_font_variant[font_name]
+                 and font_name:find("-Regular") then
+        local bold_font_name = font_name:gsub("-Regular", "-Bold", 1, true)
+        bold_candidates[bold_font_name] = fallback_font_path
+    end
+end
+
+for _, font_path in ipairs(FontList:getFontList()) do
+    local _, bold_font_name = util.splitFilePathName(font_path)
+    local fallback_font_path = bold_candidates[bold_font_name]
+    if bold_font_name and fallback_font_path then
+        Font.bold_font_variant[fallback_font_path] = font_path
+        Font.regular_font_variant[font_path] = fallback_font_path
+        bold_candidates[bold_font_name] = nil
+    end
+    if #bold_candidates == 0 then
+        break
+    end
+end
+bold_candidates = nil -- luacheck: ignore
+
+-- Helper functions with explicit names around
 -- bold/regular_font_variant tables
 function Font:hasBoldVariant(name)
     return self.bold_font_variant[name] and true or false
@@ -136,7 +186,7 @@ function Font:getRegularVariantName(name)
     return self.regular_font_variant[name] or name
 end
 
--- Synthetized bold strength can be tuned:
+-- Synthesized bold strength can be tuned:
 -- local bold_strength_factor = 1   -- really too bold
 -- local bold_strength_factor = 1/2 -- bold enough
 local bold_strength_factor = 3/8 -- as crengine, lighter
@@ -145,7 +195,7 @@ local bold_strength_factor = 3/8 -- as crengine, lighter
 local _completeFaceProperties = function(face_obj)
     if not face_obj.embolden_half_strength then
         -- Cache this value in case we use bold, to avoid recomputation
-        face_obj.embolden_half_strength = face_obj.ftface:getEmboldenHalfStrength(bold_strength_factor)
+        face_obj.embolden_half_strength = face_obj.ftsize:getEmboldenHalfStrength(bold_strength_factor)
     end
 end
 
@@ -176,7 +226,7 @@ local _getFallbackFont = function(face_obj, num)
             -- If main font is a real bold, or if it's not but we want bold,
             -- get the bold variant of the fallback if one exists.
             -- But if one exists, use the regular variant as an additional
-            -- fallback, drawn with synthetized bold (often, bold fonts
+            -- fallback, drawn with synthesized bold (often, bold fonts
             -- have less glyphs than their regular counterpart).
             if face_obj.is_real_bold or face_obj.wants_bold == true then
                                 -- (not if wants_bold==Font.FORCE_SYNTHETIZED_BOLD)
@@ -214,10 +264,11 @@ end
 --- Gets font face object.
 -- @string font
 -- @int size optional size
+-- @int faceindex optional index of font face in font file
 -- @treturn table @{FontFaceObj}
-function Font:getFace(font, size)
+function Font:getFace(font, size, faceindex)
     -- default to content font
-    if not font then font = self.cfont end
+    if not font then font = self.fontmap.cfont end
 
     if not size then size = self.sizemap[font] end
     -- original size before scaling by screen DPI
@@ -235,12 +286,25 @@ function Font:getFace(font, size)
     -- Make a hash from the realname (many fonts in our fontmap use
     -- the same font file: have them share their glyphs cache)
     local hash = realname..size
+    if faceindex then
+        hash = hash .. "/" .. faceindex
+    end
 
     local face_obj = self.faces[hash]
-    -- build face if not found
-    if not face_obj then
+    if face_obj then
+        -- Font found
+        if face_obj.orig_size ~= orig_size then
+            -- orig_size has changed (which may happen on small orig_size variations
+            -- mapping to a same final size, but more importantly when geometry
+            -- or dpi has changed): keep it updated, so code that would reuse
+            -- it to fetch another font get the current original font size and
+            -- not one from the past
+            face_obj.orig_size = orig_size
+        end
+    else
+        -- Build face size if not found
         local builtin_font_location = FontList.fontdir.."/"..realname
-        local ok, face = pcall(Freetype.newFace, builtin_font_location, size)
+        local ok, ftsize = pcall(Freetype.newFaceSize, builtin_font_location, size, faceindex)
 
         -- Not all fonts are bundled on all platforms because they come with the system.
         -- In that case, search through all font folders for the requested font.
@@ -251,14 +315,14 @@ function Font:getFace(font, size)
             for _k, _v in ipairs(fonts) do
                 if _v:find(escaped_realname) then
                     logger.dbg("Found font:", realname, "in", _v)
-                    ok, face = pcall(Freetype.newFace, _v, size)
+                    ok, ftsize = pcall(Freetype.newFaceSize, _v, size, faceindex)
 
                     if ok then break end
                 end
             end
         end
         if not ok then
-            logger.err("#! Font ", font, " (", realname, ") not supported: ", face)
+            logger.err("#! Font ", font, " (", realname, ") not supported: ", ftsize)
             return nil
         end
         --- Freetype font face wrapper object
@@ -266,14 +330,14 @@ function Font:getFace(font, size)
         -- @field orig_font font name requested
         -- @field size size of the font face (after scaled by screen size)
         -- @field orig_size raw size of the font face (before scale)
-        -- @field ftface font face object from freetype
+        -- @field ftsize font size object from freetype
         -- @field hash hash key for this font face
         face_obj = {
             orig_font = font,
             realname = realname,
             size = size,
             orig_size = orig_size,
-            ftface = face,
+            ftsize = ftsize,
             hash = hash,
             is_real_bold = is_real_bold,
         }
@@ -322,8 +386,8 @@ function Font:getAdjustedFace(face, bold)
     if face.is_real_bold then
         -- No adjustment needed: main real bold font will ensure
         -- fallback fonts use their associated bold font or
-        -- get synthetized bold - whether bold is requested or not
-        -- (Set returned bold to true, to force synthetized bold
+        -- get synthesized bold - whether bold is requested or not
+        -- (Set returned bold to true, to force synthesized bold
         -- on fallback fonts with no associated real bold)
         -- (Drop bold=FORCE_SYNTHETIZED_BOLD and use 'true' if
         -- we were given a real bold font.)
@@ -349,8 +413,8 @@ function Font:getAdjustedFace(face, bold)
         end
     end
     -- Only the regular font is available, and bold requested:
-    -- we'll have synthetized bold - but _getFallbackFont() should
-    -- build a list of fallback fonts either synthetized, or possibly
+    -- we'll have synthesized bold - but _getFallbackFont() should
+    -- build a list of fallback fonts either synthesized, or possibly
     -- using the bold variant of a regular fallback font.
     -- We don't want to collide with the regular font face_obj.fallbacks
     -- so let's make a shallow clone of this face_obj, and have it cached.
@@ -368,13 +432,13 @@ function Font:getAdjustedFace(face, bold)
         orig_size = face.orig_size,
         -- We can keep the same FT object and the same hash in this face_obj
         -- (which is only used to identify cached glyphs, that we don't need
-        -- to distinguish as "bold" is appended when synthetized as bold)
-        ftface = face.ftface,
+        -- to distinguish as "bold" is appended when synthesized as bold)
+        ftsize = face.ftsize,
         hash = face.hash,
         hb_features = face.hb_features,
         is_real_bold = nil,
         wants_bold = bold, -- true or Font.FORCE_SYNTHETIZED_BOLD, used
-                           -- to pick the appropritate fallback fonts
+                           -- to pick the appropriate fallback fonts
     }
     face_obj.getFallbackFont = function(num)
         return _getFallbackFont(face_obj, num)

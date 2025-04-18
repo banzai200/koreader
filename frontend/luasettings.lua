@@ -3,22 +3,25 @@ This module handles generic settings as well as KOReader's global settings syste
 ]]
 
 local dump = require("dump")
-local ffiutil = require("ffi/util")
 local lfs = require("libs/libkoreader-lfs")
 local logger = require("logger")
+local util = require("util")
 
 local LuaSettings = {}
 
-function LuaSettings:new(o)
+function LuaSettings:extend(o)
     o = o or {}
     setmetatable(o, self)
     self.__index = self
     return o
 end
+-- NOTE: Instances are created via open, so we do *NOT* implement a new method, to avoid confusion.
 
 --- Opens a settings file.
 function LuaSettings:open(file_path)
-    local new = {file=file_path}
+    local new = LuaSettings:extend{
+        file = file_path,
+    }
     local ok, stored
 
     -- File being absent and returning an empty table is a use case,
@@ -29,25 +32,25 @@ function LuaSettings:open(file_path)
     if ok and stored then
         new.data = stored
     else
-        if existing then logger.warn("Failed reading", new.file, "(probably corrupted).") end
+        if existing then logger.warn("LuaSettings: Failed reading", new.file, "(probably corrupted).") end
         -- Fallback to .old if it exists
         ok, stored = pcall(dofile, new.file..".old")
         if ok and stored then
-            if existing then logger.warn("read from backup file", new.file..".old") end
+            if existing then logger.warn("LuaSettings: read from backup file", new.file..".old") end
             new.data = stored
         else
-            if existing then logger.warn("no usable backup file for", new.file, "to read from") end
+            if existing then logger.warn("LuaSettings: no usable backup file for", new.file, "to read from") end
             new.data = {}
         end
     end
 
-    return setmetatable(new, {__index = LuaSettings})
+    return new
 end
 
---- @todo DocSettings can return a LuaSettings to use following awesome features.
 function LuaSettings:wrap(data)
-    local new = {data = type(data) == "table" and data or {}}
-    return setmetatable(new, {__index = LuaSettings})
+    return self:extend{
+        data = type(data) == "table" and data or {},
+    }
 end
 
 --[[--Reads child settings.
@@ -56,7 +59,7 @@ end
 
     Settings:saveSetting("key", {
         a = "b",
-        c = "true",
+        c = true,
         d = false,
     })
 
@@ -66,11 +69,32 @@ end
     -- result "b"
 ]]
 function LuaSettings:child(key)
-    return LuaSettings:wrap(self:readSetting(key))
+    return self:wrap(self:readSetting(key))
 end
 
---- Reads a setting.
-function LuaSettings:readSetting(key)
+--[[-- Reads a setting, optionally initializing it to a default.
+
+If default is provided, and the key doesn't exist yet, it is initialized to default first.
+This ensures both that the defaults are actually set if necessary,
+and that the returned reference actually belongs to the LuaSettings object straight away,
+without requiring further interaction (e.g., saveSetting) from the caller.
+
+This is mainly useful if the data type you want to retrieve/store is assigned/returned/passed by reference (e.g., a table),
+and you never actually break that reference by assigning another one to the same variable, (by e.g., assigning it a new object).
+c.f., <https://www.lua.org/manual/5.1/manual.html#2.2>.
+
+@param key The setting's key
+@param default Initialization data (Optional)
+]]
+function LuaSettings:readSetting(key, default)
+    -- No initialization data: legacy behavior
+    if not default then
+        return self.data[key]
+    end
+
+    if not self:has(key) then
+        self.data[key] = default
+    end
     return self.data[key]
 end
 
@@ -88,22 +112,22 @@ end
 
 --- Checks if setting exists.
 function LuaSettings:has(key)
-    return self:readSetting(key) ~= nil
+    return self.data[key] ~= nil
 end
 
 --- Checks if setting does not exist.
 function LuaSettings:hasNot(key)
-    return self:readSetting(key) == nil
+    return self.data[key] == nil
 end
 
---- Checks if setting is `true`.
+--- Checks if setting is `true` (boolean).
 function LuaSettings:isTrue(key)
-    return string.lower(tostring(self:readSetting(key))) == "true"
+    return self.data[key] == true
 end
 
---- Checks if setting is `false`.
+--- Checks if setting is `false` (boolean).
 function LuaSettings:isFalse(key)
-    return string.lower(tostring(self:readSetting(key))) == "false"
+    return self.data[key] == false
 end
 
 --- Checks if setting is `nil` or `true`.
@@ -116,7 +140,8 @@ function LuaSettings:nilOrFalse(key)
     return self:hasNot(key) or self:isFalse(key)
 end
 
---- Flips `nil` or `true` to `false`.
+--- Flips `nil` or `true` to `false`, and `false` to `nil`.
+--- e.g., a setting that defaults to true.
 function LuaSettings:flipNilOrTrue(key)
     if self:nilOrTrue(key) then
         self:saveSetting(key, false)
@@ -126,7 +151,8 @@ function LuaSettings:flipNilOrTrue(key)
     return self
 end
 
---- Flips `nil` or `false` to `true`.
+--- Flips `nil` or `false` to `true`, and `true` to `nil`.
+--- e.g., a setting that defaults to false.
 function LuaSettings:flipNilOrFalse(key)
     if self:nilOrFalse(key) then
         self:saveSetting(key, true)
@@ -136,7 +162,7 @@ function LuaSettings:flipNilOrFalse(key)
     return self
 end
 
---- Flips setting to `true`.
+--- Flips a setting between `true` and `nil`.
 function LuaSettings:flipTrue(key)
     if self:isTrue(key) then
         self:delSetting(key)
@@ -146,7 +172,7 @@ function LuaSettings:flipTrue(key)
     return self
 end
 
---- Flips setting to `false`.
+--- Flips a setting between `false` and `nil`.
 function LuaSettings:flipFalse(key)
     if self:isFalse(key) then
         self:delSetting(key)
@@ -154,6 +180,51 @@ function LuaSettings:flipFalse(key)
         self:saveSetting(key, false)
     end
     return self
+end
+
+-- Unconditionally makes a boolean setting `true`.
+function LuaSettings:makeTrue(key)
+    self:saveSetting(key, true)
+    return self
+end
+
+-- Unconditionally makes a boolean setting `false`.
+function LuaSettings:makeFalse(key)
+    self:saveSetting(key, false)
+    return self
+end
+
+--- Toggles a boolean setting
+function LuaSettings:toggle(key)
+    if self:nilOrFalse(key) then
+        self:saveSetting(key, true)
+    else
+        self:saveSetting(key, false)
+    end
+    return self
+end
+
+-- Initializes settings per extension with default values
+function LuaSettings:initializeExtSettings(key, defaults, force_init)
+    local curr = self:readSetting(key)
+    if not curr or force_init then
+        self:saveSetting(key, defaults)
+        return true
+    end
+    return false
+end
+
+-- Returns saved setting for given extension
+function LuaSettings:getSettingForExt(key, ext)
+    local saved_settings = self:readSetting(key) or {}
+    return saved_settings[ext]
+end
+
+-- Sets setting for given extension
+function LuaSettings:saveSettingForExt(key, value, ext)
+    local saved_settings = self:readSetting(key) or {}
+    saved_settings[ext] = value
+    self:saveSetting(key, saved_settings)
 end
 
 --- Adds item to table.
@@ -178,35 +249,28 @@ function LuaSettings:reset(table)
     return self
 end
 
+function LuaSettings:backup(file)
+    file = file or self.file
+    local directory_updated
+    if lfs.attributes(file, "mode") == "file" then
+        -- As an additional safety measure (to the ffiutil.fsync* calls used in util.writeToFile),
+        -- we only backup the file to .old when it has not been modified in the last 60 seconds.
+        -- This should ensure in the case the fsync calls are not supported
+        -- that the OS may have itself sync'ed that file content in the meantime.
+        local mtime = lfs.attributes(file, "modification")
+        if mtime < os.time() - 60 then
+            os.rename(file, file .. ".old")
+            directory_updated = true -- fsync directory content
+        end
+    end
+    return directory_updated
+end
+
 --- Writes settings to disk.
 function LuaSettings:flush()
     if not self.file then return end
-    local directory_updated = false
-    if lfs.attributes(self.file, "mode") == "file" then
-        -- As an additional safety measure (to the ffiutil.fsync* calls
-        -- used below), we only backup the file to .old when it has
-        -- not been modified in the last 60 seconds. This should ensure
-        -- in the case the fsync calls are not supported that the OS
-        -- may have itself sync'ed that file content in the meantime.
-        local mtime = lfs.attributes(self.file, "modification")
-        if mtime < os.time() - 60 then
-            os.rename(self.file, self.file .. ".old")
-            directory_updated = true -- fsync directory content too below
-        end
-    end
-    local f_out = io.open(self.file, "w")
-    if f_out ~= nil then
-        os.setlocale('C', 'numeric')
-        f_out:write("-- we can read Lua syntax here!\nreturn ")
-        f_out:write(dump(self.data))
-        f_out:write("\n")
-        ffiutil.fsyncOpenedFile(f_out) -- force flush to the storage device
-        f_out:close()
-    end
-    if directory_updated then
-        -- Ensure the file renaming is flushed to storage device
-        ffiutil.fsyncDirectory(self.file)
-    end
+    local directory_updated = self:backup()
+    util.writeToFile(dump(self.data, nil, true), self.file, true, true, directory_updated)
     return self
 end
 

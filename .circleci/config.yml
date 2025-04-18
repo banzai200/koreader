@@ -1,79 +1,163 @@
-version: 2
-jobs:
-  build:
+version: "2.1"
+
+# Parameters. {{{
+
+parameters:
+
+    # Bump this to reset all caches.
+    cache_epoch:
+      type: integer
+      default: 2
+
+# }}}
+
+# Executors. {{{
+
+executors:
+
+  base:
     docker:
-      - image: koreader/koappimage:0.1.7
-        environment:
-          EMULATE_READER: 1
-          # this is for shellcheck 0.4.5 and lower; can be removed for 0.4.6
-          LC_ALL: en_US.UTF8
-    parallelism: 2
+      - image: koreader/kobase:0.3.4-20.04
+        auth:
+          username: $DOCKER_USERNAME
+          password: $DOCKER_PASSWORD
+
+# }}}
+
+# Jobs. {{{
+
+jobs:
+
+  # Build. {{{
+
+  build:
+    executor: base
+    resource_class: medium
+    environment:
+      BASH_ENV: "~/.bashrc"
+      CCACHE_MAXSIZE: "128M"
+      CLICOLOR_FORCE: "1"
+      EMULATE_READER: "1"
+      MAKEFLAGS: "PARALLEL_JOBS=3 OUTPUT_DIR=build INSTALL_DIR=install"
+    steps:
+      # Checkout / fetch. {{{
+      - checkout
+      - run:
+          name: Fetch
+          command: .ci/fetch.sh
+      # }}}
+      # Check.
+      - run:
+          name: Check
+          command: .ci/check.sh
+      # Restore / setup caches. {{{
+      - run:
+          name: Generate cache key
+          command: make TARGET= cache-key
+      - restore_cache:
+          name: Restore build directory
+          keys:
+            - &CACHE_KEY_BUILD_DIR '<< pipeline.parameters.cache_epoch >>-{{ .Environment.CIRCLE_JOB }}-build-{{ arch }}-{{ checksum "cache-key" }}'
+      - restore_cache:
+          name: Restore build cache
+          keys:
+            - &CACHE_KEY_BUILD_CACHE '<< pipeline.parameters.cache_epoch >>-{{ .Environment.CIRCLE_JOB }}-ccache-{{ arch }}-{{ checksum "cache-key" }}'
+            - '<< pipeline.parameters.cache_epoch >>-{{ .Environment.CIRCLE_JOB }}-ccache-{{ arch }}-'
+      - run:
+          name: Setup build cache
+          command: |
+            set -x
+            which ccache
+            ccache --version
+            ccache --zero-stats
+            ccache --show-config
+      # }}}
+      # Build.
+      - run:
+          name: Build
+          command: .ci/build.sh
+      # Clean / save caches. {{{
+      # We want to save cache prior to testing so we don't have to clean it up.
+      - run:
+          name: Clean caches
+          when: always
+          command: |
+            set -x
+            # Trim the build directory.
+            rm -rf build/{cmake,staging,thirdparty}
+            ccache --cleanup >/dev/null
+            ccache --show-stats --verbose
+      - save_cache:
+          name: Save build cache
+          key: *CACHE_KEY_BUILD_CACHE
+          paths:
+            - /home/ko/.cache/ccache
+      - save_cache:
+          name: Save build directory
+          key: *CACHE_KEY_BUILD_DIR
+          paths:
+            - build
+      # }}}
+      # Tests / coverage. {{{
+      # Our lovely unit tests.
+      - run:
+          name: Test
+          command: .ci/test.sh
+      # Upload coverage statistics (master branch only).
+      - run:
+          name: Uploading coverage
+          command: .ci/after_success.sh
+      # Store test results for better feedback / insights.
+      - store_test_results:
+          path: &TESTS_XML test-results.xml
+      # CircleCI doesn't make the test results available as artifacts (October 2017).
+      - store_artifacts:
+          path: *TESTS_XML
+      # }}}
+
+  # }}}
+
+  # Docs. {{{
+
+  docs:
+    executor: base
+    resource_class: small
+    environment:
+      BASH_ENV: "~/.bashrc"
     steps:
       - checkout
-      - restore_cache:
-          keys:
-            # binary dependencies require {{ arch }} because there are different CPUs in use on the servers
-            - deps-{{ arch }}-{{ checksum ".ci/install.sh" }}-{{ checksum ".ci/helper_luarocks.sh" }}
-      # need to init some stuff first or git will complain when sticking in base cache
-      - run: git submodule init base && git submodule update base && pushd base && git submodule init && git submodule update && popd
-      # we can't use command output directly for cache check so we write it to git-rev-base
-      - run: pushd base && git_rev_base=$(git describe HEAD) && popd && echo $git_rev_base && echo $git_rev_base >git-rev-base
-      - restore_cache:
-          keys:
-            - build-{{ arch }}-{{ checksum "git-rev-base" }}
-      - run: echo 'export PATH=${HOME}/bin:${PATH}' >> $BASH_ENV
-      - run:
-          name: setup
-          command: .ci/before_install.sh
-
-      # installs and caches testing tools
-      - run:
-          name: install
-          command: .ci/install.sh
-      - save_cache:
-          key: deps-{{ arch }}-{{ checksum ".ci/install.sh" }}-{{ checksum ".ci/helper_luarocks.sh" }}
-          paths:
-            - "/home/ko/bin"
-            - "/home/ko/.luarocks"
-            # compiled luarocks binaries
-            - "install"
-
-      # installs everything and caches base
       - run:
           name: fetch
           command: .ci/fetch.sh
+      # Docs & translations (master branch only).
       - run:
-          name: check
-          command: .ci/check.sh
-      - run:
-          name: build
-          command: .ci/build.sh
-      # we want to save cache prior to testing so we don't have to clean it up
-      - save_cache:
-          key: build-{{ arch }}-{{ checksum "git-rev-base" }}
-          paths:
-            - "/home/ko/.ccache"
-            - "base"
+          name: docs-and-translation
+          command: .ci/after_success_docs_translation.sh
 
-      # our lovely unit tests
-      - run:
-          name: test
-          command: .ci/test.sh
+  # }}}
 
-      # docs, coverage, and test timing (can we use two outputs at once?); master branch only
-      - run:
-          name: docs-and-coverage
-          command: .ci/after_success.sh
-      # by storing the test results CircleCI automatically distributes tests based on execution time
-      - store_test_results:
-          path: koreader-emulator-x86_64-linux-gnu/koreader
-      # CircleCI doesn't make the test results available as artifacts (October 2017)
-      - store_artifacts:
-          path: koreader-emulator-x86_64-linux-gnu/koreader/junit-test-results.xml
+# }}}
+
+# Workflows. {{{
 
 workflows:
+
   version: 2
+
   build:
+
     jobs:
-      - build:
+
+      - build
+
+      - docs:
           context: koreader-vars
+          filters:
+            branches:
+              only: master
+          requires:
+            - build
+
+# }}}
+
+# vim: foldmethod=marker foldlevel=0

@@ -9,12 +9,13 @@ local BD = require("ui/bidi")
 local Blitbuffer = require("ffi/blitbuffer")
 local CenterContainer = require("ui/widget/container/centercontainer")
 local Device = require("device")
+local FocusManager = require("ui/widget/focusmanager")
 local Font = require("ui/font")
 local Geom = require("ui/geometry")
 local GestureRange = require("ui/gesturerange")
 local HorizontalGroup = require("ui/widget/horizontalgroup")
-local InputContainer = require("ui/widget/container/inputcontainer")
 local FrameContainer = require("ui/widget/container/framecontainer")
+local Notification = require("ui/widget/notification")
 local Size = require("ui/size")
 local TextWidget = require("ui/widget/textwidget")
 local UIManager = require("ui/uimanager")
@@ -22,13 +23,13 @@ local VerticalGroup = require("ui/widget/verticalgroup")
 local _ = require("gettext")
 local Screen = Device.screen
 
-local ToggleLabel = TextWidget:new{
+local ToggleLabel = TextWidget:extend{
     bold = true,
     bgcolor = Blitbuffer.COLOR_WHITE,
     fgcolor = Blitbuffer.COLOR_BLACK,
 }
 
-local ToggleSwitch = InputContainer:new{
+local ToggleSwitch = FocusManager:extend{
     width = Screen:scaleBySize(216),
     height = Size.item.height_default,
     bgcolor = Blitbuffer.COLOR_WHITE, -- unfocused item color
@@ -40,6 +41,7 @@ local ToggleSwitch = InputContainer:new{
 }
 
 function ToggleSwitch:init()
+    self.layout = {{}}
     -- Item count per row
     self.n_pos = math.ceil(#self.toggle / self.row_count)
     self.position = nil
@@ -99,31 +101,31 @@ function ToggleSwitch:init()
             radius = Size.radius.window,
             bordersize = item_border_size,
             padding = 0,
+            focusable = true,
+            focus_border_size = item_border_size,
+            focus_border_color = Blitbuffer.COLOR_BLACK,
             content,
         }
         table.insert(self.toggle_content[math.ceil(i / self.n_pos)], button)
+        table.insert(self.layout[1], button)
     end
     self.toggle_frame[1] = self.toggle_content
     self[1] = self.toggle_frame
     self.dimen = Geom:new(self.toggle_frame:getSize())
-    if Device:isTouchDevice() then
-        self.ges_events = {
-            TapSelect = {
-                GestureRange:new{
-                    ges = "tap",
-                    range = self.dimen,
-                },
-                doc = "Toggle switch",
+    self.ges_events = {
+        TapSelect = {
+            GestureRange:new{
+                ges = "tap",
+                range = self.dimen,
             },
-            HoldSelect = {
-                GestureRange:new{
-                    ges = "hold",
-                    range = self.dimen,
-                },
-                doc = "Hold switch",
+        },
+        HoldSelect = {
+            GestureRange:new{
+                ges = "hold",
+                range = self.dimen,
             },
-        }
-    end
+        },
+    }
 end
 
 function ToggleSwitch:update()
@@ -209,18 +211,25 @@ function ToggleSwitch:onTapSelect(arg, gev)
         self.args = self.args or {}
         self.config:onConfigEvent(self.event, self.args[self.position])
     end
-    if self.events then
-        self.config:onConfigEvents(self.events, self.position)
-    end
     --]]
     if self.callback then
         self.callback(self.position)
     end
     if self.toggle[self.position] ~= "⋮" then
+        if #self.values == 0 then -- this is a toggle which is not selectable (eg. increase, decrease)
+            Notification:setNotifySource(Notification.SOURCE_BOTTOM_MENU_FINE)
+        else
+            Notification:setNotifySource(Notification.SOURCE_BOTTOM_MENU_TOGGLE)
+        end
         self.config:onConfigChoose(self.values, self.name,
-            self.event, self.args, self.events, self.position, self.delay_repaint)
+            self.event, self.args, self.position, self.hide_on_apply)
+
         UIManager:setDirty(self.config, function()
             return "ui", self.dimen
+        end)
+
+        UIManager:tickAfterNext(function()
+            Notification:resetNotifySource()
         end)
     end
     return true
@@ -228,7 +237,7 @@ end
 
 function ToggleSwitch:onHoldSelect(arg, gev)
     local position = self:calculatePosition(gev)
-    if self.toggle[position] == "⋮" then
+    if self.toggle[position] == "⋮" or self.config.onMakeDefault == nil then
         return true
     end
     if self.name == "font_fine_tune" then
@@ -239,16 +248,6 @@ function ToggleSwitch:onHoldSelect(arg, gev)
         self.config:onMakeDefault(self.name, self.name_text,
                         self.values or self.args, self.toggle, position)
     end
-    return true
-end
-
-function ToggleSwitch:onFocus()
-    self.toggle_frame.background = Blitbuffer.COLOR_BLACK
-    return true
-end
-
-function ToggleSwitch:onUnfocus()
-    self.toggle_frame.background = Blitbuffer.COLOR_WHITE
     return true
 end
 

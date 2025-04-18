@@ -13,8 +13,8 @@ local ConfirmBox = require("ui/widget/confirmbox")
 local InfoMessage = require("ui/widget/infomessage")
 local TrapWidget = require("ui/widget/trapwidget")
 local UIManager = require("ui/uimanager")
+local buffer = require("string.buffer")
 local ffiutil = require("ffi/util")
-local dump = require("dump")
 local logger = require("logger")
 local _ = require("gettext")
 
@@ -43,8 +43,10 @@ function Trapper:wrap(func)
     -- Catch and log any error happening in func (an error happening
     -- in a coroutine just aborts silently the coroutine)
     local pcalled_func = function()
+        UIManager:preventStandby()
         -- we use xpcall as it can give a whole stacktrace, unlike pcall
         local ok, err = xpcall(func, debug.traceback)
+        UIManager:allowStandby()
         if not ok then
             logger.warn("error in wrapped function:", err)
             return false
@@ -113,13 +115,14 @@ exact same size.
 
 @string text text to display as an InfoMessage (or nil to keep existing one)
 @boolean fast_refresh[opt=false] true for faster refresh
+@boolean skip_dismiss_check[opt=false] true to return immediately, to avoid the 100 ms delay for interim update
 @treturn boolean true if InfoMessage was not dismissed, false if dismissed
 
 @usage
     Trapper:info("some text about step or progress")
     go_on = Trapper:info()
 ]]
-function Trapper:info(text, fast_refresh)
+function Trapper:info(text, fast_refresh, skip_dismiss_check)
     local _coroutine = coroutine.running()
     if not _coroutine then
         logger.info("unwrapped info:", text)
@@ -135,16 +138,19 @@ function Trapper:info(text, fast_refresh)
         -- the coroutine.yield() that follows.
         -- If no dismiss_callback was fired, we need to get this code resumed:
         -- that will be done with the following go_on_func schedule in 0.1 second.
-        local go_on_func = function() coroutine.resume(_coroutine, true) end
-        -- delay matters: 0.05 or 0.1 seems fine
-        -- 0.01 is too fast: go_on_func is called before our dismiss_callback is processed
-        UIManager:scheduleIn(0.1, go_on_func)
+        local go_on = true
+        local go_on_func
+        if not skip_dismiss_check then
+            go_on_func = function() coroutine.resume(_coroutine, true) end
+            -- delay matters: 0.05 or 0.1 seems fine
+            -- 0.01 is too fast: go_on_func is called before our dismiss_callback is processed
+            UIManager:scheduleIn(0.1, go_on_func)
 
-        local go_on = coroutine.yield() -- gives control back to UIManager
-        -- go_on is the 2nd arg given to the coroutine.resume() that got us resumed:
-        -- false if it was a dismiss_callback
-        -- true if it was the schedule go_on_func
-
+            go_on = coroutine.yield() -- gives control back to UIManager
+            -- go_on is the 2nd arg given to the coroutine.resume() that got us resumed:
+            -- false if it was a dismiss_callback
+            -- true if it was the schedule go_on_func
+        end
         if not go_on then -- dismiss_callback called
             UIManager:unschedule(go_on_func) -- no more need for this scheduled action
             -- Don't just return false without confirmation (this tap may have been
@@ -163,6 +169,9 @@ function Trapper:info(text, fast_refresh)
                 ok_callback = function()
                     coroutine.resume(_coroutine, false)
                 end,
+                -- flush any pending tap, so past events won't be considered
+                -- action on the yet to be displayed widget
+                flush_events_on_show = true,
             }
             UIManager:show(abort_box)
             -- no need to forceRePaint, UIManager will do it when we yield()
@@ -174,8 +183,10 @@ function Trapper:info(text, fast_refresh)
                 return false
             end
             if self.current_widget then
-                -- Re-show current widget that was dismissed
-                -- (this is fine for our simple InfoMessage)
+                -- Resurrect a dead widget. This should only be performed by trained Necromancers.
+                -- Do NOT do this at home, kids.
+                -- Some state *might* be lost, but the basics should survive...
+                self.current_widget:init()
                 UIManager:show(self.current_widget)
             end
             UIManager:forceRePaint()
@@ -183,10 +194,6 @@ function Trapper:info(text, fast_refresh)
         -- go_on_func returned result = true, or abort_box did not abort:
         -- continue processing
     end
-
-    --- @todo We should try to flush any pending tap, so past
-    -- events won't be considered action on the yet to be displayed
-    -- widget
 
     -- If fast_refresh option, avoid UIManager refresh overhead
     if fast_refresh and self.current_widget and self.current_widget.is_infomessage then
@@ -196,7 +203,7 @@ function Trapper:info(text, fast_refresh)
         self.current_widget:init()
         self.current_widget.movable:setMovedOffset(orig_moved_offset)
         local Screen = require("device").screen
-        self.current_widget:paintTo(Screen.bb, 0,0)
+        self.current_widget:paintTo(Screen.bb, 0, 0)
         local d = self.current_widget[1][1].dimen
         Screen.refreshUI(Screen, d.x, d.y, d.w, d.h)
     else
@@ -212,7 +219,10 @@ function Trapper:info(text, fast_refresh)
             dismiss_callback = function()
                 coroutine.resume(_coroutine, false)
             end,
-            is_infomessage = true -- flag on our InfoMessages
+            is_infomessage = true, -- flag on our InfoMessages
+            -- flush any pending tap, so past events won't be considered
+            -- action on the yet to be displayed widget
+            flush_events_on_show = true,
         }
         logger.dbg("Showing InfoMessage:", text)
         UIManager:show(self.current_widget)
@@ -266,10 +276,6 @@ function Trapper:confirm(text, cancel_text, ok_text)
         return true -- always select "OK" in ConfirmBox if no UI
     end
 
-    --- @todo We should try to flush any pending tap, so past
-    -- events won't be considered action on the yet to be displayed
-    -- widget
-
     -- Close any previous widget
     if self.current_widget then
         UIManager:close(self.current_widget)
@@ -287,6 +293,9 @@ function Trapper:confirm(text, cancel_text, ok_text)
         ok_callback = function()
             coroutine.resume(_coroutine, true)
         end,
+        -- flush any pending tap, so past events won't be considered
+        -- action on the yet to be displayed widget
+        flush_events_on_show = true,
     }
     logger.dbg("Showing ConfirmBox and waiting for answer:", text)
     UIManager:show(self.current_widget)
@@ -392,7 +401,7 @@ function Trapper:dismissablePopen(cmd, trap_widget_or_string)
         -- We check regularly if data is available to be read, and we give control
         -- in the meantime to UIManager so our trap_widget's dismiss_callback
         -- get a chance to be triggered, in which case we won't wait for reading,
-        -- We'll schedule a background function to collect the uneeded output and
+        -- We'll schedule a background function to collect the unneeded output and
         -- close the pipe later.
         while true do
             -- Every 10 iterations, increase interval until a max of 1 sec is reached
@@ -412,7 +421,7 @@ function Trapper:dismissablePopen(cmd, trap_widget_or_string)
                 -- zombie processes.
                 local collect_and_clean
                 collect_and_clean = function()
-                    if ffiutil.getNonBlockingReadSize(std_out) ~= 0 then -- cmd started outputing
+                    if ffiutil.getNonBlockingReadSize(std_out) ~= 0 then -- cmd started outputting
                         std_out:read("*all")
                         std_out:close()
                         logger.dbg("collected cancelled cmd output")
@@ -482,7 +491,7 @@ Notes and limitations:
    an invisible TrapWidget will be used instead (if nil or true, the event will be
    resent; if false, the event will not be resent).
 
-@function task lua function to execute and get return values from
+@param task lua function to execute and get return values from
 @param trap_widget_or_string already shown widget, string, or nil, true or false
 @boolean task_returns_simple_string[opt=false] true if task returns a single string
 @treturn boolean completed (`true` if not interrupted, `false` if dismissed)
@@ -537,13 +546,13 @@ function Trapper:dismissableRunInSubprocess(task, trap_widget_or_string, task_re
     local check_num = 0
 
     local completed = false
-    local ret_values = nil
+    local ret_values
 
     local pid, parent_read_fd = ffiutil.runInSubProcess(function(pid, child_write_fd)
         local output_str = ""
         if task_returns_simple_string then
-            -- task is assumed to return only a string or nil, avoid
-            -- possibly expensive dump()/dofile()
+            -- task is assumed to return only a string or nil,
+            -- so avoid a possibly expensive ser/deser roundtrip.
             local result = task()
             if type(result) == "string" then
                 output_str = result
@@ -551,15 +560,16 @@ function Trapper:dismissableRunInSubprocess(task, trap_widget_or_string, task_re
                 logger.warn("returned value from task is not a string:", result)
             end
         else
-            -- task may return complex data structures, that we dump()
-            -- Note: be sure these data structures contain only classic types,
-            -- and no function (dofile() with fail if it meets
-            -- "function: 0x55949671c670"...)
-            -- task may also return multiple return values, so we
-            -- wrap them in a table (beware the { } construct may stop
-            -- at the first nil met)
-            local results = { task() }
-            output_str = "return "..dump(results).."\n"
+            -- task may return complex data structures, that we serialize.
+            -- NOTE: LuaJIT's serializer currently doesn't support:
+            --       functions, coroutines, non-numerical FFI cdata & full userdata.
+            local results = table.pack(task())
+            local ok, str = pcall(buffer.encode, results)
+            if not ok then
+                logger.warn("cannot serialize", tostring(results), "->", str)
+            else
+                output_str = str
+            end
         end
         ffiutil.writeToFD(child_write_fd, output_str, true)
     end, true) -- with_pipe = true
@@ -594,7 +604,7 @@ function Trapper:dismissableRunInSubprocess(task, trap_widget_or_string, task_re
                         logger.dbg("collected previously dismissed subprocess")
                     else
                         if parent_read_fd and ffiutil.getNonBlockingReadSize(parent_read_fd) ~= 0 then
-                            -- If subprocess started outputing to fd, read from it,
+                            -- If subprocess started outputting to fd, read from it,
                             -- so its write() stops blocking and subprocess can exit
                             ffiutil.readAllFromFD(parent_read_fd)
                             -- We closed our fd, don't try again to read or close it
@@ -610,12 +620,12 @@ function Trapper:dismissableRunInSubprocess(task, trap_widget_or_string, task_re
             end
             -- The go_on_func resumed us: we have not been dismissed.
             -- Check if sub process has ended
-            -- Depending on the the size of what the child has to write,
+            -- Depending on the size of what the child has to write,
             -- it may has ended (if data fits in the kernel pipe buffer) or
             -- it may still be alive blocking on write() (if data exceeds
             -- the kernel pipe buffer)
             local subprocess_done = ffiutil.isSubProcessDone(pid)
-            local stuff_to_read = parent_read_fd and ffiutil.getNonBlockingReadSize(parent_read_fd) ~=0
+            local stuff_to_read = parent_read_fd and ffiutil.getNonBlockingReadSize(parent_read_fd) ~= 0
             logger.dbg("subprocess_done:", subprocess_done, " stuff_to_read:", stuff_to_read)
             if subprocess_done or stuff_to_read then
                 -- Subprocess is gone or nearly gone
@@ -623,13 +633,13 @@ function Trapper:dismissableRunInSubprocess(task, trap_widget_or_string, task_re
                 if stuff_to_read then
                     local ret_str = ffiutil.readAllFromFD(parent_read_fd)
                     if task_returns_simple_string then
-                        ret_values = { ret_str }
+                        ret_values = ret_str
                     else
-                        local ok, results = pcall(load(ret_str))
-                        if ok and results then
-                            ret_values = results
+                        local ok, t = pcall(buffer.decode, ret_str)
+                        if ok and t then
+                            ret_values = t
                         else
-                            logger.warn("load() failed:", results)
+                            logger.warn("malformed serialized data:", t)
                         end
                     end
                     if not subprocess_done then
@@ -667,7 +677,11 @@ function Trapper:dismissableRunInSubprocess(task, trap_widget_or_string, task_re
     end
     -- return what we got or not to our caller
     if ret_values then
-        return completed, unpack(ret_values)
+        if task_returns_simple_string then
+            return completed, ret_values
+        else
+            return completed, unpack(ret_values, 1, ret_values.n)
+        end
     end
     return completed
 end

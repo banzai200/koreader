@@ -1,23 +1,19 @@
 local isAndroid, _ = pcall(require, "android")
+local lfs = require("libs/libkoreader-lfs")
 local util = require("ffi/util")
 
 local function probeDevice()
-    if util.isSDL() then
-        return require("device/sdl/device")
-    end
-
     if isAndroid then
         return require("device/android/device")
     end
 
-    local kindle_sn = io.open("/proc/usid", "r")
-    if kindle_sn then
-        kindle_sn:close()
+    local kindle_test_stat = lfs.attributes("/proc/usid")
+    if kindle_test_stat then
         return require("device/kindle/device")
     end
 
-    local kg_test_stat = lfs.attributes("/bin/kobo_config.sh")
-    if kg_test_stat then
+    local kobo_test_stat = lfs.attributes("/bin/kobo_config.sh")
+    if kobo_test_stat then
         return require("device/kobo/device")
     end
 
@@ -46,6 +42,10 @@ local function probeDevice()
     -- if --[[ implement a proper test instead --]] false then
     --     return require("device/newport/device")
     -- end
+
+    if util.loadSDL2() then
+        return require("device/sdl/device")
+    end
 
     error("Could not find hardware abstraction for this platform. If you are trying to run the emulator, please ensure SDL is installed.")
 end

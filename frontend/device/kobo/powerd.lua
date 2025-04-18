@@ -1,10 +1,10 @@
 local BasePowerD = require("device/generic/powerd")
+local Math = require("optmath")
 local NickelConf = require("device/kobo/nickel_conf")
-local PluginShare = require("pluginshare")
-local SysfsLight = require ("device/sysfs_light")
-
-local batt_state_folder =
-        "/sys/devices/platform/pmic_battery.1/power_supply/mc13892_bat/"
+local SysfsLight = require("device/sysfs_light")
+local UIManager
+local logger = require("logger")
+local RTC = require("ffi/rtc")
 
 -- Here, we only deal with the real hw intensity.
 -- Dealing with toggling and remembering/restoring
@@ -15,22 +15,18 @@ local KoboPowerD = BasePowerD:new{
     fl_min = 0, fl_max = 100,
     fl = nil,
 
-    batt_capacity_file = batt_state_folder .. "capacity",
-    is_charging_file = batt_state_folder .. "status",
+    battery_sysfs = nil,
+    aux_battery_sysfs = nil,
     fl_warmth_min = 0, fl_warmth_max = 100,
-    fl_warmth = nil,
-    auto_warmth = false,
-    max_warmth_hour = 23,
-    fl_was_on = nil,
 }
 
---- @todo Remove KOBO_LIGHT_ON_START
+--- @todo Remove G_defaults:readSetting("KOBO_LIGHT_ON_START")
 function KoboPowerD:_syncKoboLightOnStart()
     local new_intensity = nil
     local is_frontlight_on = nil
     local new_warmth = nil
-    local auto_warmth = nil
-    local kobo_light_on_start = tonumber(KOBO_LIGHT_ON_START)
+    local kobo_light_on_start = tonumber(G_defaults:readSetting("KOBO_LIGHT_ON_START"))
+
     if kobo_light_on_start then
         if kobo_light_on_start > 0 then
             new_intensity = math.min(kobo_light_on_start, 100)
@@ -46,10 +42,9 @@ function KoboPowerD:_syncKoboLightOnStart()
                 if new_color ~= nil then
                     -- ColorSetting is stored as a color temperature scale in Kelvin,
                     -- from 1500 to 6400
-                    -- so normalize this to [0,100] on our end.
-                    new_warmth = (100 - math.floor((new_color - 1500) / 49))
+                    -- so normalize this to [0, 100] on our end.
+                    new_warmth = (100 - Math.round((new_color - 1500) * (1/49)))
                 end
-                auto_warmth = NickelConf.autoColorEnabled.get()
             end
             if is_frontlight_on == nil then
                 -- this device does not support frontlight toggle,
@@ -73,7 +68,6 @@ function KoboPowerD:_syncKoboLightOnStart()
             is_frontlight_on = G_reader_settings:readSetting("is_frontlight_on")
             if self.fl_warmth ~= nil then
                 new_warmth = G_reader_settings:readSetting("frontlight_warmth")
-                auto_warmth = G_reader_settings:readSetting("frontlight_auto_warmth")
             end
         end
     end
@@ -85,49 +79,85 @@ function KoboPowerD:_syncKoboLightOnStart()
         -- will only be used to give initial state to BasePowerD:_decideFrontlightState()
         self.initial_is_fl_on = is_frontlight_on
     end
-    -- This is always read from G_reader_settings, since we do not
-    -- support reading 'BedTime' from NickelConf.
-    local max_warmth_hour =
-        G_reader_settings:readSetting("frontlight_max_warmth_hour")
-    if max_warmth_hour then
-        self.max_warmth_hour = max_warmth_hour
-    end
-    if auto_warmth then
-        self.auto_warmth = true
-        self:calculateAutoWarmth()
-    elseif new_warmth ~= nil then
+
+    if new_warmth ~= nil then
         self.fl_warmth = new_warmth
     end
 
-    -- In any case frontlight is off, ensure intensity is non-zero so untoggle works
+    -- In case frontlight is off, ensure hw_intensity is non-zero so toggle on works
     if self.initial_is_fl_on == false and self.hw_intensity == 0 then
         self.hw_intensity = 1
     end
 end
 
 function KoboPowerD:init()
+    -- Setup the sysfs paths
+    self.batt_capacity_file = self.battery_sysfs .. "/capacity"
+    self.is_charging_file = self.battery_sysfs .. "/status"
+
+    if self.device:hasAuxBattery() then
+        self.aux_batt_capacity_file = self.aux_battery_sysfs .. "/cilix_bat_capacity"
+        self.aux_batt_connected_file = self.aux_battery_sysfs .. "/cilix_conn" -- or "active"
+        self.aux_batt_charging_file = self.aux_battery_sysfs .. "/charge_status" -- "usb_conn" would not allow us to detect the "Full" state
+
+        self.getAuxCapacityHW = function(this)
+            -- NOTE: The first few reads after connecting to the PowerCover may fail, in which case,
+            --       we pass that detail along to PowerD so that it may retry the call sooner.
+            return this:unchecked_read_int_file(this.aux_batt_capacity_file)
+        end
+
+        self.isAuxBatteryConnectedHW = function(this)
+            -- aux_batt_connected_file shows us:
+            -- 0 if power cover is not connected
+            -- 1 if the power cover is connected
+            -- 1 or sometimes -1 if the power cover is connected without a charger
+            return this:read_int_file(this.aux_batt_connected_file) ~= 0
+        end
+
+        self.isAuxChargingHW = function(this)
+            -- 0 when discharging
+            -- 3 when full
+            -- 2 when charging via DCP
+            return this:read_int_file(this.aux_batt_charging_file) ~= 0
+        end
+
+        self.isAuxChargedHW = function(this)
+            return this:read_int_file(this.aux_batt_charging_file) == 3
+        end
+    end
+
     -- Default values in case self:_syncKoboLightOnStart() does not find
     -- any previously saved setting (and for unit tests where it will
     -- not be called)
     self.hw_intensity = 20
     self.initial_is_fl_on = true
-    self.autowarmth_job_running = false
 
     if self.device:hasFrontlight() then
-        -- If this device has natural light (currently only KA1 & Forma)
-        -- Use the SysFS interface, and ioctl otherwise.
+        self.device.frontlight_settings = self.device.frontlight_settings or {}
+        -- Does this device require non-standard ramping behavior?
+        self.device.frontlight_settings.ramp_off_delay = self.device.frontlight_settings.ramp_off_delay or 0.0
+        --- @note: Newer devices (or at least some PWM controllers) appear to block slightly longer on FL ioctls/sysfs,
+        ---        so we only really need a delay on older devices.
+        self.device.frontlight_settings.ramp_delay = self.device.frontlight_settings.ramp_delay or (self.device:hasNaturalLight() and 0.0 or 0.025)
+        -- Some PWM controllers *really* don't like being interleaved between screen refreshes,
+        -- so we delay the *start* of the ramp on these.
+        self.device.frontlight_settings.delay_ramp_start = self.device.frontlight_settings.delay_ramp_start or false
+
+        -- If this device has natural light, use the sysfs interface, and ioctl otherwise.
         -- NOTE: On the Forma, nickel still appears to prefer using ntx_io to handle the FL,
         --       but it does use sysfs for the NL...
         if self.device:hasNaturalLight() then
             local nl_config = G_reader_settings:readSetting("natural_light_config")
             if nl_config then
-                for key,val in pairs(nl_config) do
+                for key, val in pairs(nl_config) do
                     self.device.frontlight_settings[key] = val
                 end
             end
             -- Does this device's NaturalLight use a custom scale?
             self.fl_warmth_min = self.device.frontlight_settings.nl_min or self.fl_warmth_min
             self.fl_warmth_max = self.device.frontlight_settings.nl_max or self.fl_warmth_max
+            -- Generic does it *after* init, but we're going to need it *now*...
+            self.warmth_scale = 100 / self.fl_warmth_max
             -- If this device has a mixer, we can use the ioctl for brightness control, as it's much lower latency.
             if self.device:hasNaturalLightMixer() then
                 local kobolight = require("ffi/kobolight")
@@ -152,7 +182,7 @@ function KoboPowerD:init()
         if self:isFrontlightOnHW() then
             -- On devices with a mixer, setIntensity will *only* set the FL, so, ensure we honor the warmth, too.
             if self.device:hasNaturalLightMixer() then
-               self:setWarmth(self.fl_warmth)
+               self:setWarmth(self.fl_warmth, true)
             end
             -- Use setIntensity to ensure it sets fl_intensity, and because we don't want the ramping behavior of turnOn
             self:setIntensity(self:frontlightIntensityHW())
@@ -178,18 +208,14 @@ function KoboPowerD:saveSettings()
         -- be turned on but we still want to save its state.
         local cur_is_fl_on = self.is_fl_on or self.fl_was_on or false
         local cur_warmth = self.fl_warmth
-        local cur_auto_warmth = self.auto_warmth
-        local cur_max_warmth_hour = self.max_warmth_hour
         -- Save intensity to koreader settings
         G_reader_settings:saveSetting("frontlight_intensity", cur_intensity)
         G_reader_settings:saveSetting("is_frontlight_on", cur_is_fl_on)
         if cur_warmth ~= nil then
             G_reader_settings:saveSetting("frontlight_warmth", cur_warmth)
-            G_reader_settings:saveSetting("frontlight_auto_warmth", cur_auto_warmth)
-            G_reader_settings:saveSetting("frontlight_max_warmth_hour", cur_max_warmth_hour)
         end
         -- And to "Kobo eReader.conf" if needed
-        if KOBO_SYNC_BRIGHTNESS_WITH_NICKEL then
+        if G_defaults:readSetting("KOBO_SYNC_BRIGHTNESS_WITH_NICKEL") then
             if NickelConf.frontLightState.get() ~= nil then
                 if NickelConf.frontLightState.get() ~= cur_is_fl_on then
                     NickelConf.frontLightState.set(cur_is_fl_on)
@@ -207,9 +233,6 @@ function KoboPowerD:saveSettings()
                 if NickelConf.colorSetting.get() ~= warmth_rescaled then
                     NickelConf.colorSetting.set(warmth_rescaled)
                 end
-                if NickelConf.autoColorEnabled.get() ~= cur_auto_warmth then
-                    NickelConf.autoColorEnabled.set(cur_auto_warmth)
-                end
             end
         end
     end
@@ -221,16 +244,16 @@ end
 
 function KoboPowerD:isFrontlightOnHW()
     if self.initial_is_fl_on ~= nil then -- happens only once after init()
-        -- give initial state to BasePowerD, which will
-        -- reset our self.hw_intensity to 0 if self.initial_is_fl_on is false
+        -- Pass our initial state to BasePowerD,
+        -- which will reset our self.hw_intensity to 0 if self.initial_is_fl_on is false
         local ret = self.initial_is_fl_on
         self.initial_is_fl_on = nil
         return ret
     end
-    return self.hw_intensity > 0
+    return self.hw_intensity > 0 and not self.fl_ramp_down_running
 end
 
-function KoboPowerD:setIntensityHW(intensity)
+function KoboPowerD:_setIntensityHW(intensity)
     if self.fl == nil then return end
     if self.fl_warmth == nil or self.device:hasNaturalLightMixer() then
         -- We either don't have NL, or we have a mixer: we only want to set the intensity (c.f., #5429)
@@ -240,70 +263,30 @@ function KoboPowerD:setIntensityHW(intensity)
         self.fl:setNaturalBrightness(intensity, self.fl_warmth)
     end
     self.hw_intensity = intensity
-    -- Now that we have set intensity, we need to let BasePowerD
-    -- know about possibly changed frontlight state (if we came
-    -- from light toggled off to some intensity > 0).
+    -- Now that we have set the intensity,
+    -- we need to let BasePowerD know about the possibly new frontlight state
+    -- (if we came from light toggled off to some intensity > 0).
     self:_decideFrontlightState()
 end
 
-function KoboPowerD:setWarmth(warmth)
+function KoboPowerD:setIntensityHW(intensity)
+    self:_stopFrontlightRamp()
+    self:_setIntensityHW(intensity)
+end
+
+-- NOTE: We *can* actually read this from the system (as well as frontlight level, since Mk. 7),
+--       but this is already a huge mess, so, keep ignoring it...
+function KoboPowerD:frontlightWarmthHW()
+    return self.fl_warmth
+end
+
+function KoboPowerD:setWarmthHW(warmth)
     if self.fl == nil then return end
-    if not warmth and self.auto_warmth then
-        self:calculateAutoWarmth()
-    end
-    self.fl_warmth = warmth or self.fl_warmth
     -- Don't turn the light back on on legacy NaturalLight devices just for the sake of setting the warmth!
     -- That's because we can only set warmth independently of brightness on devices with a mixer.
     -- On older ones, calling setWarmth *will* actually set the brightness, too!
     if self.device:hasNaturalLightMixer() or self:isFrontlightOnHW() then
-        self.fl:setWarmth(self.fl_warmth)
-    end
-end
-
--- Sets fl_warmth according to current hour and max_warmth_hour
--- and starts background job if necessary.
-function KoboPowerD:calculateAutoWarmth()
-    local current_time = os.date("%H") + os.date("%M")/60
-    local max_hour = self.max_warmth_hour
-    local diff_time = max_hour - current_time
-    if diff_time < 0 then
-        diff_time = diff_time + 24
-    end
-    if diff_time < 12 then
-        -- We are before bedtime. Use a slower progression over 5h.
-        self.fl_warmth = math.max(20 * (5 - diff_time), 0)
-    elseif diff_time > 22 then
-        -- Keep warmth at maximum for two hours after bedtime.
-        self.fl_warmth = 100
-    else
-        -- Between 2-4h after bedtime, return to zero.
-        self.fl_warmth = math.max(100 - 50 * (22 - diff_time), 0)
-    end
-    self.fl_warmth = math.floor(self.fl_warmth + 0.5)
-    -- Make sure sysfs_light actually picks that new value up without an explicit setWarmth call...
-    -- This avoids having to bypass the ramp-up on resume w/ an explicit setWarmth call on devices where brightness & warmth
-    -- are linked (i.e., when there's no mixer) ;).
-    -- NOTE: A potentially saner solution would be to ditch the internal sysfs_light current_* values,
-    --       and just pass it a pointer to this powerd instance, so it has access to fl_warmth & hw_intensity.
-    --       It seems harmless enough for warmth, but brightness might be a little trickier because of the insanity
-    --       that is hw_intensity handling because we can't actually *read* the frontlight status...
-    --       (Technically, we could, on Mk. 7 devices, but we don't,
-    --       because this is already messy enough without piling on special cases.)
-    if self.fl then
-        self.fl.current_warmth = self.fl_warmth
-    end
-    -- Enable background job for setting Warmth, if not already done.
-    if not self.autowarmth_job_running then
-        table.insert(PluginShare.backgroundJobs, {
-                         when = 180,
-                         repeated = true,
-                         executable = function()
-                             if self.auto_warmth then
-                                 self:setWarmth()
-                             end
-                         end,
-        })
-        self.autowarmth_job_running = true
+        self.fl:setWarmth(warmth)
     end
 end
 
@@ -311,44 +294,141 @@ function KoboPowerD:getCapacityHW()
     return self:read_int_file(self.batt_capacity_file)
 end
 
+-- NOTE: Match the behavior of the ntx_io _Is_USB_plugged ioctl!
+--       (Otherwise, a device that is fully charged, but still plugged in will no longer be flagged as charging).
 function KoboPowerD:isChargingHW()
-    return self:read_str_file(self.is_charging_file) == "Charging\n"
+    return self:read_str_file(self.is_charging_file) ~= "Discharging"
 end
 
-function KoboPowerD:turnOffFrontlightHW()
+function KoboPowerD:isChargedHW()
+    -- On sunxi, the proper "Full" status is reported, while older kernels (even Mk. 9) report "Not charging"
+    -- c.f., POWER_SUPPLY_PROP_STATUS in ricoh61x_batt_get_prop @ drivers/power/ricoh619-battery.c
+    --       (or drivers/power/supply/ricoh619-battery.c on newer kernels).
+    local status = self:read_str_file(self.is_charging_file)
+    if status == "Full" then
+        return true
+    elseif status == "Not charging" and self:getCapacity() == 100 then
+        return true
+    end
+
+    return false
+end
+
+-- NOTE: When ramping down, we start from the *actual* intensity (hw_intensity),
+--       instead of the expected one (fl_intensity),
+--       in case a previously incomplete ramp was canceled and left us in an inconsistent state.
+function KoboPowerD:_startRampDown(done_callback)
+    self:turnOffFrontlightRamp(self.hw_intensity, self.fl_min, done_callback)
+    self.fl_ramp_down_running = true
+end
+
+function KoboPowerD:_endRampDown(end_intensity, done_callback)
+    self:_setIntensityHW(end_intensity)
+    self.fl_ramp_down_running = false
+
+    if done_callback then
+        done_callback()
+    end
+end
+
+function KoboPowerD:_stopFrontlightRamp()
+    if self.fl_ramp_up_running or self.fl_ramp_down_running then
+        -- Make sure we have no other ramp running.
+        UIManager:unschedule(self.turnOffFrontlightRamp)
+        UIManager:unschedule(self.turnOnFrontlightRamp)
+        UIManager:unschedule(self._startRampDown)
+        UIManager:unschedule(self._endRampDown)
+        UIManager:unschedule(self._startRampUp)
+        UIManager:unschedule(self._endRampUp)
+        self.fl_ramp_up_running = false
+        self.fl_ramp_down_running = false
+    end
+end
+
+-- This will ramp down faster at high intensity values (i.e., start), and slower at lower intensity values (i.e., end).
+-- That's an attempt at making the *perceived* effect appear as a more linear brightness change.
+-- The whole function gets called at most log(100)/log(0.75) = 17 times,
+-- leading to a 0.025*17 + 0.5 = 0.925s ramp down time (non blocking); can be aborted.
+function KoboPowerD:turnOffFrontlightRamp(curr_ramp_intensity, end_intensity, done_callback)
+    curr_ramp_intensity = math.floor(math.max(curr_ramp_intensity * .75, self.fl_min))
+
+    if curr_ramp_intensity > end_intensity then
+        self:_setIntensityHW(curr_ramp_intensity)
+        UIManager:scheduleIn(self.device.frontlight_settings.ramp_delay, self.turnOffFrontlightRamp, self, curr_ramp_intensity, end_intensity, done_callback)
+    else
+        -- Some devices require delaying the final step, to prevent them from jumping straight to zero and messing up the ramp.
+        UIManager:scheduleIn(self.device.frontlight_settings.ramp_off_delay, self._endRampDown, self, end_intensity, done_callback)
+        -- no reschedule here, as we are done
+    end
+end
+
+function KoboPowerD:turnOffFrontlightHW(done_callback)
     if not self:isFrontlightOnHW() then
         return
     end
-    local util = require("ffi/util")
-    util.runInSubProcess(function()
-        for i = 1,5 do
-            self:_setIntensity(math.floor(self.fl_intensity - ((self.fl_intensity / 5) * i)))
-            --- @note: Newer devices appear to block slightly longer on FL ioctls/sysfs, so only sleep on older devices,
-            ---        otherwise we get a jump and not a ramp ;).
-            if not self.device:hasNaturalLight() then
-                if (i < 5) then
-                    util.usleep(35 * 1000)
+
+    if UIManager then
+        -- We've got nothing to do if we're already ramping down
+        if not self.fl_ramp_down_running then
+            self:_stopFrontlightRamp()
+            -- NOTE: For devices with a ramp_off_delay, we only ramp if we start from > 2%,
+            --       otherwise you just see a single delayed step (1%) or two stuttery ones (2%) ;).
+            -- FWIW, modern devices with a different PWM controller (i.e., with no controller-specific ramp_off_delay workarounds)
+            -- deal with our 2% ramp without stuttering.
+            if self.device.frontlight_settings.ramp_off_delay > 0.0 and self.hw_intensity <= 2 then
+                UIManager:scheduleIn(self.device.frontlight_settings.ramp_delay, self._endRampDown, self, self.fl_min, done_callback)
+            else
+                -- NOTE: Similarly, some controllers *really* don't like to be interleaved with screen refreshes,
+                --       so we wait until the next UI frame for the refreshes to go through first...
+                if self.device.frontlight_settings.delay_ramp_start then
+                    UIManager:nextTick(self._startRampDown, self, done_callback)
+                else
+                    self:turnOffFrontlightRamp(self.hw_intensity, self.fl_min, done_callback)
+                    self.fl_ramp_down_running = true
                 end
             end
         end
-    end, false, true)
-    -- NOTE: This is essentially what _setIntensity does, except we don't actually touch the FL,
-    --       we only sync the state of the main process with the final state of what we're doing in the forks.
-    -- And update hw_intensity in our actual process ;).
-    self.hw_intensity = self.fl_min
-    -- NOTE: And don't forget to update sysfs_light, too, as a real _setIntensity would via setBrightness
-    if self.fl then
-        self.fl.current_brightness = self.fl_min
+    else
+        -- If UIManager is not initialized yet, just turn it off immediately
+        self:setIntensityHW(self.fl_min)
     end
-    self:_decideFrontlightState()
-    -- And let the footer know of the change
-    if package.loaded["ui/uimanager"] ~= nil then
-        local Event = require("ui/event")
-        local UIManager = require("ui/uimanager")
-        UIManager:broadcastEvent(Event:new("FrontlightStateChanged"))
+
+    -- We consume done_callback ourselves, make sure Generic's PowerD gets the memo
+    return true
+end
+
+function KoboPowerD:_startRampUp(done_callback)
+    self:turnOnFrontlightRamp(self.fl_min, self.fl_intensity, done_callback)
+    self.fl_ramp_up_running = true
+end
+
+function KoboPowerD:_endRampUp(end_intensity, done_callback)
+    self:_setIntensityHW(end_intensity)
+    self.fl_ramp_up_running = false
+
+    if done_callback then
+        done_callback()
     end
 end
-function KoboPowerD:turnOnFrontlightHW()
+
+-- Similar functionality as `Kobo:turnOffFrontlightRamp`, but the other way around ;).
+function KoboPowerD:turnOnFrontlightRamp(curr_ramp_intensity, end_intensity, done_callback)
+    if curr_ramp_intensity == 0 then
+        curr_ramp_intensity = 1
+    else
+        curr_ramp_intensity = math.ceil(math.min(curr_ramp_intensity * 1.5, self.fl_max))
+    end
+
+    if curr_ramp_intensity < end_intensity then
+        self:_setIntensityHW(curr_ramp_intensity)
+        UIManager:scheduleIn(self.device.frontlight_settings.ramp_delay, self.turnOnFrontlightRamp, self, curr_ramp_intensity, end_intensity, done_callback)
+    else
+        UIManager:scheduleIn(self.device.frontlight_settings.ramp_delay, self._endRampUp, self, end_intensity, done_callback)
+        -- no reschedule here, as we are done
+    end
+end
+
+function KoboPowerD:turnOnFrontlightHW(done_callback)
     -- NOTE: Insane workaround for the first toggle after a startup with the FL off.
     -- The light is actually off, but hw_intensity couldn't have been set to a sane value because of a number of interactions.
     -- So, fix it now, so we pass the isFrontlightOnHW check (which checks if hw_intensity > fl_min).
@@ -358,60 +438,103 @@ function KoboPowerD:turnOnFrontlightHW()
     if self:isFrontlightOnHW() then
         return
     end
-    local util = require("ffi/util")
-    util.runInSubProcess(function()
-        for i = 1,5 do
-            self:_setIntensity(math.ceil(self.fl_min + ((self.fl_intensity / 5) * i)))
-            --- @note: Newer devices appear to block slightly longer on FL ioctls/sysfs, so only sleep on older devices,
-            ---        otherwise we get a jump and not a ramp ;).
-            if not self.device:hasNaturalLight() then
-                if (i < 5) then
-                    util.usleep(35 * 1000)
+
+    if UIManager then
+        -- We've got nothing to do if we're already ramping up
+        if not self.fl_ramp_up_running then
+            self:_stopFrontlightRamp()
+            if self.device.frontlight_settings.ramp_off_delay > 0.0 and self.fl_intensity <= 2 then
+                -- NOTE: Match the ramp down behavior on devices with a ramp_off_delay: jump straight to 1 or 2% intensity.
+                UIManager:scheduleIn(self.device.frontlight_settings.ramp_delay, self._endRampUp, self, self.fl_intensity, done_callback)
+            else
+                -- Same deal as in turnOffFrontlightHW
+                if self.device.frontlight_settings.delay_ramp_start then
+                    UIManager:nextTick(self._startRampUp, self, done_callback)
+                else
+                    self:turnOnFrontlightRamp(self.fl_min, self.fl_intensity, done_callback)
+                    self.fl_ramp_up_running = true
                 end
             end
         end
-    end, false, true)
-    -- NOTE: This is essentially what _setIntensity does, except we don't actually touch the FL,
-    --       we only sync the state of the main process with the final state of what we're doing in the forks.
-    -- And update hw_intensity in our actual process ;).
-    self.hw_intensity = self.fl_intensity
-    -- NOTE: And don't forget to update sysfs_light, too, as a real _setIntensity would via setBrightness
-    if self.fl then
-        self.fl.current_brightness = self.fl_intensity
+    else
+        -- If UIManager is not initialized yet, just turn it on immediately
+        self:setIntensityHW(self.fl_intensity)
     end
-    self:_decideFrontlightState()
-    -- And let the footer know of the change
-    if package.loaded["ui/uimanager"] ~= nil then
-        local Event = require("ui/event")
-        local UIManager = require("ui/uimanager")
-        UIManager:broadcastEvent(Event:new("FrontlightStateChanged"))
-    end
+
+    -- We consume done_callback ourselves, make sure Generic's PowerD gets the memo
+    return true
+end
+
+function KoboPowerD:_suspendFrontlight()
+    self:turnOffFrontlight()
 end
 
 -- Turn off front light before suspend.
 function KoboPowerD:beforeSuspend()
-    if self.fl == nil then return end
-    -- Remember the current frontlight state
-    self.fl_was_on = self.is_fl_on
-    -- Turn off the frontlight
-    self:turnOffFrontlight()
+    -- Inhibit user input and emit the Suspend event.
+    self.device:_beforeSuspend()
+
+    -- Handle the frontlight last,
+    -- to prevent as many things as we can from interfering with the smoothness of the ramp
+    if self.fl then
+        -- We only want the *last* scheduled suspend/resume frontlight task to run to avoid ramps running amok...
+        UIManager:unschedule(self._suspendFrontlight)
+        UIManager:unschedule(self._resumeFrontlight)
+        self:_stopFrontlightRamp()
+
+        -- Turn off the frontlight
+        -- NOTE: Funky delay mainly to yield to the EPDC's refresh on UP systems.
+        --       (Neither yieldToEPDC nor nextTick & friends quite cut it here)...
+        UIManager:scheduleIn(0.001, self._suspendFrontlight, self)
+    end
+end
+
+function KoboPowerD:_resumeFrontlight()
+    -- Don't bother if the light was already off on suspend
+    -- NOTE: Things gan go sideways quick when you mix the userland ramp,
+    --       delays all over the place, and quick successions of suspend/resume requests (e.g., jittery sleepcovers),
+    --       so trust fl_was_on over the actual state on beforeSuspend,
+    --       as said state might no longer actually represent the pre-suspend reality...
+    --       c.f., #12246
+    -- Note that fl_was_on is updated by *interactive* callers via `BasePowerD:updateResumeFrontlightState`
+    if self.fl_was_on then
+        -- If the frontlight is currently on because of madness resulting from multiple concurrent suspend/resume requests,
+        -- but at the wrong intensity, turn it straight off first so that turnOnFrontlight doesn't abort early...
+        if self.is_fl_on and self.hw_intensity ~= self.fl_intensity then
+            logger.warn("KoboPowerD:_resumeFrontlight: frontlight intensity is at", self.hw_intensity, "instead of the expected", self.fl_intensity)
+            self:setIntensityHW(self.fl_min)
+        end
+        -- Turn the frontlight back on
+        self:turnOnFrontlight()
+    end
 end
 
 -- Restore front light state after resume.
 function KoboPowerD:afterResume()
-    if self.fl == nil then return end
-    -- Don't bother if the light was already off on suspend
-    if not self.fl_was_on then return end
-    -- Update AutoWarmth state
-    if self.fl_warmth ~= nil and self.auto_warmth then
-        self:calculateAutoWarmth()
-        -- And we need an explicit setWarmth if the device has a mixer, because turnOn won't touch the warmth on those ;).
-        if self.device:hasNaturalLightMixer() then
-            self:setWarmth(self.fl_warmth)
-        end
+    -- Set the system clock to the hardware clock's time.
+    RTC:HCToSys()
+
+    self:invalidateCapacityCache()
+
+    -- Restore user input and emit the Resume event.
+    self.device:_afterResume()
+
+    -- There's a whole bunch of stuff happening before us in Generic:onPowerEvent,
+    -- so we'll delay this ever so slightly so as to appear as smooth as possible...
+    if self.fl then
+        -- Same reasoning as on suspend
+        UIManager:unschedule(self._suspendFrontlight)
+        UIManager:unschedule(self._resumeFrontlight)
+        self:_stopFrontlightRamp()
+
+        -- Turn the frontlight back on
+        -- NOTE: There's quite likely *more* resource contention than on suspend here :/.
+        UIManager:scheduleIn(0.001, self._resumeFrontlight, self)
     end
-    -- Turn the frontlight back on
-    self:turnOnFrontlight()
+end
+
+function KoboPowerD:UIManagerReadyHW(uimgr)
+    UIManager = uimgr
 end
 
 return KoboPowerD

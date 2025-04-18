@@ -7,11 +7,14 @@ local MultiInputDialog = require("ui/widget/multiinputdialog")
 local UIManager = require("ui/uimanager")
 local ReaderUI = require("apps/reader/readerui")
 local util = require("util")
-local Screen = require("device").screen
 local T = require("ffi/util").template
 local _ = require("gettext")
 
 local DropBox = {}
+
+function DropBox:getAccessToken(refresh_token, app_key_colon_secret)
+    return DropBoxApi:getAccessToken(refresh_token, app_key_colon_secret)
+end
 
 function DropBox:run(url, password, choose_folder_mode)
     return DropBoxApi:listFolder(url, password, choose_folder_mode)
@@ -21,7 +24,7 @@ function DropBox:showFiles(url, password)
     return DropBoxApi:showFiles(url, password)
 end
 
-function DropBox:downloadFile(item, password, path, close)
+function DropBox:downloadFile(item, password, path, callback_close)
     local code_response = DropBoxApi:downloadFile(item.url, password, path)
     if code_response == 200 then
         local __, filename = util.splitFilePathName(path)
@@ -34,7 +37,13 @@ function DropBox:downloadFile(item, password, path, close)
                 text = T(_("File saved to:\n%1\nWould you like to read the downloaded book now?"),
                     BD.filepath(path)),
                 ok_callback = function()
-                    close()
+                    local Event = require("ui/event")
+                    UIManager:broadcastEvent(Event:new("SetupShowReader"))
+
+                    if callback_close then
+                        callback_close()
+                    end
+
                     ReaderUI:showReader(path)
                 end
             })
@@ -49,53 +58,77 @@ end
 
 function DropBox:downloadFileNoUI(url, password, path)
     local code_response = DropBoxApi:downloadFile(url, password, path)
+    return code_response == 200
+end
+
+function DropBox:uploadFile(url, password, file_path, callback_close)
+    local code_response = DropBoxApi:uploadFile(url, password, file_path)
+    local __, filename = util.splitFilePathName(file_path)
     if code_response == 200 then
-        return true
+        UIManager:show(InfoMessage:new{
+            text = T(_("File uploaded:\n%1"), filename),
+        })
+        if callback_close then
+            callback_close()
+        end
     else
-        return false
+        UIManager:show(InfoMessage:new{
+            text = T(_("Could not upload file:\n%1"), filename),
+        })
+    end
+end
+
+function DropBox:createFolder(url, password, folder_name, callback_close)
+    local code_response = DropBoxApi:createFolder(url, password, folder_name)
+    if code_response == 200 then
+        if callback_close then
+            callback_close()
+        end
+    else
+        UIManager:show(InfoMessage:new{
+            text = T(_("Could not create folder:\n%1"), folder_name),
+        })
     end
 end
 
 function DropBox:config(item, callback)
-    local text_info = "How to generate Access Token:\n"..
-        "1. Open the following URL in your Browser, and log in using your account: https://www.dropbox.com/developers/apps.\n"..
-        "2. Click on >>Create App<<, then select >>Dropbox API app<<.\n"..
-        "3. Now go on with the configuration, choosing the app permissions and access restrictions to your DropBox folder.\n"..
-        "4. Enter the >>App Name<< that you prefer (e.g. KOReader).\n"..
-        "5. Now, click on the >>Create App<< button.\n" ..
-        "6. When your new App is successfully created, please click on the Generate button.\n"..
-        "7. Under the 'Generated access token' section, then enter code in Dropbox token field."
-    local hint_top = _("Your Dropbox name")
-    local text_top = ""
-    local hint_bottom = _("Dropbox token\n\n\n\n")
-    local text_bottom = ""
-    local title
-    local text_button_right = _("Add")
+    local text_info = _([[
+Dropbox access tokens are short-lived (4 hours).
+To generate new access token please use Dropbox refresh token and <APP_KEY>:<APP_SECRET> string.
+
+Some of the previously generated long-lived tokens are still valid.]])
+    local text_name, text_token, text_appkey, text_url
     if item then
-        title = _("Edit Dropbox account")
-        text_button_right = _("Apply")
-        text_top = item.text
-        text_bottom = item.password
-    else
-        title = _("Add Dropbox account")
+        text_name = item.text
+        text_token = item.password
+        text_appkey = item.address
+        text_url = item.url
     end
     self.settings_dialog = MultiInputDialog:new {
-        title = title,
+        title = _("Dropbox cloud storage"),
         fields = {
             {
-                text = text_top,
-                hint = hint_top ,
+                text = text_name,
+                hint = _("Cloud storage displayed name"),
             },
             {
-                text = text_bottom,
-                hint = hint_bottom,
-                scroll = false,
+                text = text_token,
+                hint = _("Dropbox refresh token\nor long-lived token (deprecated)"),
+            },
+            {
+                text = text_appkey,
+                hint = _("Dropbox <APP_KEY>:<APP_SECRET>\n(leave blank for long-lived token)"),
+            },
+            {
+                text = text_url,
+                hint = _("Dropbox folder (/ for root)"),
             },
         },
         buttons = {
             {
                 {
                     text = _("Cancel"),
+                    id = "close",
                     callback = function()
                         self.settings_dialog:onClose()
                         UIManager:close(self.settings_dialog)
@@ -108,31 +141,20 @@ function DropBox:config(item, callback)
                     end
                 },
                 {
-                    text = text_button_right,
+                    text = _("Save"),
                     callback = function()
-                        local fields = MultiInputDialog:getFields()
-                        if fields[1] ~= "" and fields[2] ~= "" then
-                            if item then
-                                --edit
-                                callback(item, fields)
-                            else
-                                -- add new
-                                callback(fields)
-                            end
-                            self.settings_dialog:onClose()
-                            UIManager:close(self.settings_dialog)
+                        local fields = self.settings_dialog:getFields()
+                        if item then
+                            callback(item, fields)
                         else
-                            UIManager:show(InfoMessage:new{
-                                text = _("Please fill in all fields.")
-                            })
+                            callback(fields)
                         end
+                        self.settings_dialog:onClose()
+                        UIManager:close(self.settings_dialog)
                     end
                 },
             },
         },
-        width = Screen:getWidth() * 0.95,
-        height = Screen:getHeight() * 0.2,
-        input_type = "text",
     }
     UIManager:show(self.settings_dialog)
     self.settings_dialog:onShowKeyboard()
@@ -140,14 +162,17 @@ end
 
 function DropBox:info(token)
     local info = DropBoxApi:fetchInfo(token)
-    local info_text
-    if info and info.name then
-        info_text = T(_"Type: %1\nName: %2\nEmail: %3\nCounty: %4",
-            "Dropbox",info.name.display_name, info.email, info.country)
-    else
-        info_text = _("No information available")
+    local space_usage = DropBoxApi:fetchInfo(token, true)
+    if info and space_usage then
+        local account_type = info.account_type and info.account_type[".tag"]
+        local name = info.name and info.name.display_name
+        local space_total = space_usage.allocation and space_usage.allocation.allocated
+        UIManager:show(InfoMessage:new{
+            text = T(_"Type: %1\nName: %2\nEmail: %3\nCountry: %4\nSpace total: %5\nSpace used: %6",
+                account_type, name, info.email, info.country,
+                util.getFriendlySize(space_total), util.getFriendlySize(space_usage.used)),
+        })
     end
-    UIManager:show(InfoMessage:new{text = info_text})
 end
 
 return DropBox

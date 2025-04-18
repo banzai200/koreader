@@ -2,9 +2,12 @@ local BD = require("ui/bidi")
 local Blitbuffer = require("ffi/blitbuffer")
 local BottomContainer = require("ui/widget/container/bottomcontainer")
 local Button = require("ui/widget/button")
-local CloseButton = require("ui/widget/closebutton")
+local ButtonDialog = require("ui/widget/buttondialog")
+local CenterContainer = require("ui/widget/container/centercontainer")
+local CheckMark = require("ui/widget/checkmark")
 local Device = require("device")
 local Font = require("ui/font")
+local FocusManager = require("ui/widget/focusmanager")
 local FrameContainer = require("ui/widget/container/framecontainer")
 local Geom = require("ui/geometry")
 local GestureRange = require("ui/gesturerange")
@@ -15,128 +18,101 @@ local LineWidget = require("ui/widget/linewidget")
 local OverlapGroup = require("ui/widget/overlapgroup")
 local Size = require("ui/size")
 local TextWidget = require("ui/widget/textwidget")
+local TitleBar = require("ui/widget/titlebar")
 local UIManager = require("ui/uimanager")
 local VerticalGroup = require("ui/widget/verticalgroup")
 local VerticalSpan = require("ui/widget/verticalspan")
 local Screen = Device.screen
+local util = require("util")
 local T = require("ffi/util").template
 local _ = require("gettext")
+local C_ = _.pgettext
 
-local SortTitleWidget = VerticalGroup:new{
-    sort_page = nil,
-    title = "",
-    tface = Font:getFace("tfont"),
-    align = "left",
-    use_top_page_count = false,
-}
-
-function SortTitleWidget:init()
-    self.close_button = CloseButton:new{ window = self }
-    local btn_width = self.close_button:getSize().w
-    -- title and close button
-    table.insert(self, OverlapGroup:new{
-        dimen = { w = self.width },
-        TextWidget:new{
-            text = self.title,
-            max_width = self.width - btn_width,
-            face = self.tface,
-        },
-        self.close_button,
-    })
-    -- page count and separation line
-    self.title_bottom = OverlapGroup:new{
-        dimen = { w = self.width, h = Size.line.thick },
-        LineWidget:new{
-            dimen = Geom:new{ w = self.width, h = Size.line.thick },
-            background = Blitbuffer.COLOR_DARK_GRAY,
-            style = "solid",
-        },
-    }
-    if self.use_top_page_count then
-        self.page_cnt = FrameContainer:new{
-            padding = Size.padding.default,
-            margin = 0,
-            bordersize = 0,
-            background = Blitbuffer.COLOR_WHITE,
-            -- overlap offset x will be updated in setPageCount method
-            overlap_offset = {0, -15},
-            TextWidget:new{
-                text = "",  -- page count
-                fgcolor = Blitbuffer.COLOR_DARK_GRAY,
-                face = Font:getFace("smallffont"),
-            },
-        }
-        table.insert(self.title_bottom, self.page_cnt)
-    end
-    table.insert(self, self.title_bottom)
-    table.insert(self, VerticalSpan:new{ width = Size.span.vertical_large })
-end
-
-function SortTitleWidget:setPageCount(curr, total)
-    if total == 1 then
-        -- remove page count if there is only one page
-        table.remove(self.title_bottom, 2)
-        return
-    end
-    self.page_cnt[1]:setText(curr .. "/" .. total)
-    self.page_cnt.overlap_offset[1] = (self.width - self.page_cnt:getSize().w - 10)
-    self.title_bottom[2] = self.page_cnt
-end
-
-function SortTitleWidget:onClose()
-    self.sort_page:onClose()
-    return true
-end
-
-
-local SortItemWidget = InputContainer:new{
-    key = nil,
-    cface = Font:getFace("smallinfofont"),
-    tface = Font:getFace("smallinfofontbold"),
+local SortItemWidget = InputContainer:extend{
+    item = nil,
+    face = Font:getFace("smallinfofont"),
     width = nil,
     height = nil,
 }
 
 function SortItemWidget:init()
-    self.dimen = Geom:new{w = self.width, h = self.height}
-    if Device:isTouchDevice() then
-        self.ges_events.Tap = {
-            GestureRange:new{
-                ges = "tap",
-                range = self.dimen,
-            }
+    self.dimen = Geom:new{x = 0, y = 0, w = self.width, h = self.height}
+    self.ges_events.Tap = {
+        GestureRange:new{
+            ges = "tap",
+            range = self.dimen,
         }
-        self.ges_events.Hold = {
-            GestureRange:new{
-                ges = "hold",
-                range = self.dimen,
-            }
+    }
+    self.ges_events.Hold = {
+        GestureRange:new{
+            ges = "hold",
+            range = self.dimen,
         }
-    end
+    }
 
-    local frame_padding = Size.padding.default
-    local frame_internal_width = self.width - frame_padding * 2
+    local item_checkable = false
+    local item_checked = self.item.checked
+    if self.item.checked_func then
+        item_checkable = true
+        item_checked = self.item.checked_func()
+    end
+    self.checkmark_widget = CheckMark:new{
+        checkable = item_checkable,
+        checked = item_checked,
+    }
+
+    local checked_widget = CheckMark:new{ -- for layout, to :getSize()
+        checked = true,
+    }
+
+    local text_max_width = self.width - 2 * Size.padding.default - checked_widget:getSize().w
 
     self[1] = FrameContainer:new{
         padding = 0,
         bordersize = 0,
-        LeftContainer:new{
-            dimen = {
-                w = frame_internal_width,
-                h = self.height
+        focusable = true,
+        focus_border_size = Size.border.thin,
+        LeftContainer:new{ -- needed only for auto UI mirroring
+            dimen = Geom:new{
+                w = self.width,
+                h = self.height,
             },
-            TextWidget:new{
-                text = self.text,
-                max_width = frame_internal_width,
-                face = self.tface,
-            }
+            HorizontalGroup:new{
+                align = "center",
+                CenterContainer:new{
+                    dimen = Geom:new{ w = checked_widget:getSize().w },
+                    self.checkmark_widget,
+                },
+                VerticalGroup:new{
+                    align = "left",
+                    TextWidget:new{
+                        text = self.item.text,
+                        max_width = text_max_width,
+                        face = self.item.face or self.face,
+                    },
+                    self.show_parent.underscore_checked_item and item_checked and LineWidget:new{
+                        dimen = Geom:new{ w = text_max_width, h = Size.line.thick },
+                        background = Blitbuffer.COLOR_DARK_GRAY,
+                    },
+                },
+            },
         },
     }
     self[1].invert = self.invert
 end
 
-function SortItemWidget:onTap()
-    if self.show_parent.marked == self.index then
+function SortItemWidget:onTap(_, ges)
+    if self.item.checked_func and ( self.show_parent.sort_disabled or ges.pos:intersectWith(self.checkmark_widget.dimen) ) then
+        if self.item.callback then
+            self.item:callback()
+        end
+    elseif self.show_parent.sort_disabled then
+        if self.item.callback then
+            self.item:callback()
+        else
+            return true
+        end
+    elseif self.show_parent.marked == self.index then
         self.show_parent.marked = 0
     else
         self.show_parent.marked = self.index
@@ -146,25 +122,37 @@ function SortItemWidget:onTap()
 end
 
 function SortItemWidget:onHold()
+    if self.item.hold_callback then
+        self.item:hold_callback(function() self.show_parent:_populateItems() end)
+    elseif self.item.callback then
+        self.item:callback()
+        self.show_parent:_populateItems()
+    end
     return true
 end
 
-local SortWidget = InputContainer:new{
+local SortWidget = FocusManager:extend{
     title = "",
     width = nil,
     height = nil,
     -- index for the first item to show
     show_page = 1,
-    use_top_page_count = false,
     -- table of items to sort
-    item_table = {},
+    item_table = nil, -- mandatory (array)
     callback = nil,
+    sort_disabled = false,
 }
 
 function SortWidget:init()
+    self:registerKeyEvents()
+    self.layout = {}
     -- no item is selected on start
     self.marked = 0
+    self.orig_item_table = nil
+
     self.dimen = Geom:new{
+        x = 0,
+        y = 0,
         w = self.width or Screen:getWidth(),
         h = self.height or Screen:getHeight(),
     }
@@ -179,165 +167,167 @@ function SortWidget:init()
     local padding = Size.padding.large
     self.width_widget = self.dimen.w - 2 * padding
     self.item_width = self.dimen.w - 2 * padding
+    self.footer_center_width = math.floor(self.width_widget * (22/100))
+    self.footer_button_width = math.floor(self.width_widget * (12/100))
     self.item_height = Size.item.height_big
-
     -- group for footer
-    local footer_left_text = "◀"
-    local footer_right_text = "▶"
-    local footer_first_up_text = "◀◀"
-    local footer_last_down_text = "▶▶"
+    local chevron_left = "chevron.left"
+    local chevron_right = "chevron.right"
+    local chevron_first = "chevron.first"
+    local chevron_last = "chevron.last"
     if BD.mirroredUILayout() then
-        footer_left_text, footer_right_text = footer_right_text, footer_left_text
-        footer_first_up_text, footer_last_down_text = footer_last_down_text, footer_first_up_text
+        chevron_left, chevron_right = chevron_right, chevron_left
+        chevron_first, chevron_last = chevron_last, chevron_first
     end
     self.footer_left = Button:new{
-        text = footer_left_text,
-        width = self.width_widget * 13 / 100,
+        icon = chevron_left,
+        width = self.footer_button_width,
         callback = function() self:prevPage() end,
-        text_font_size = 28,
         bordersize = 0,
-        padding = 0,
         radius = 0,
+        show_parent = self,
     }
     self.footer_right = Button:new{
-        text = footer_right_text,
-        width = self.width_widget * 13 / 100,
+        icon = chevron_right,
+        width = self.footer_button_width,
         callback = function() self:nextPage() end,
-        text_font_size = 28,
         bordersize = 0,
-        padding = 0,
         radius = 0,
+        show_parent = self,
     }
     self.footer_first_up = Button:new{
-        text = footer_first_up_text,
-        width = self.width_widget * 13 / 100,
+        icon = chevron_first,
+        width = self.footer_button_width,
         callback = function()
             if self.marked > 0 then
                 self:moveItem(-1)
             else
-                self:goToPage(1)
+                self:onGoToPage(1)
             end
         end,
-        text_font_size = 28,
         bordersize = 0,
-        padding = 0,
         radius = 0,
+        show_parent = self,
     }
     self.footer_last_down = Button:new{
-        text = footer_last_down_text,
-        width = self.width_widget * 13 / 100,
+        icon = chevron_last,
+        width = self.footer_button_width,
         callback = function()
             if self.marked > 0 then
                 self:moveItem(1)
             else
-                self:goToPage(self.pages)
+                self:onGoToPage(self.pages)
             end
         end,
-        text_font_size = 28,
         bordersize = 0,
-        padding = 0,
         radius = 0,
+        show_parent = self,
     }
     self.footer_cancel = Button:new{
-        text = "✘",
-        width = self.width_widget * 13 / 100,
+        icon = "exit",
+        width = self.footer_button_width,
         callback = function() self:onClose() end,
         bordersize = 0,
-        text_font_size = 28,
-        padding = 0,
         radius = 0,
+        show_parent = self,
     }
-
     self.footer_ok = Button:new{
-        text= "✓",
-        width = self.width_widget * 13 / 100,
+        icon = "check",
+        width = self.footer_button_width,
         callback = function() self:onReturn() end,
         bordersize = 0,
-        padding = 0,
         radius = 0,
-        text_font_size = 28,
+        show_parent = self,
     }
-
     self.footer_page = Button:new{
         text = "",
-        tap_input = {
+        hold_input = {
             title = _("Enter page number"),
-            type = "number",
+            input_type = "number",
             hint_func = function()
-                return "(" .. "1 - " .. self.pages .. ")"
+                return string.format("(1 - %s)", self.pages)
             end,
             callback = function(input)
                 local page = tonumber(input)
                 if page and page >= 1 and page <= self.pages then
-                    self:goToPage(page)
+                    self:onGoToPage(page)
                 end
             end,
+            ok_text = _("Go to page"),
         },
+        call_hold_input_on_tap = true,
         bordersize = 0,
         margin = 0,
         text_font_face = "pgfont",
         text_font_bold = false,
-        width = self.width_widget * 22 / 100,
-    }
-    local button_vertical_line = LineWidget:new{
-        dimen = Geom:new{ w = Size.line.thick, h = self.item_height * 1.25 },
-        background = Blitbuffer.COLOR_DARK_GRAY,
-        style = "solid",
+        width = self.footer_center_width,
+        show_parent = self,
     }
     self.page_info = HorizontalGroup:new{
         self.footer_cancel,
-        button_vertical_line,
         self.footer_first_up,
-        button_vertical_line,
         self.footer_left,
-        button_vertical_line,
         self.footer_page,
-        button_vertical_line,
         self.footer_right,
-        button_vertical_line,
         self.footer_last_down,
-        button_vertical_line,
         self.footer_ok,
     }
+    table.insert(self.layout, {
+        self.footer_cancel,
+        self.footer_first_up,
+        self.footer_left,
+        self.footer_page,
+        self.footer_right,
+        self.footer_last_down,
+        self.footer_ok,
+    })
     local bottom_line = LineWidget:new{
         dimen = Geom:new{ w = self.item_width, h = Size.line.thick },
         background = Blitbuffer.COLOR_DARK_GRAY,
-        style = "solid",
     }
     local vertical_footer = VerticalGroup:new{
         bottom_line,
-        self.page_info
+        self.page_info,
     }
     local footer = BottomContainer:new{
         dimen = self.dimen:copy(),
         vertical_footer,
     }
     -- setup title bar
-    self.title_bar = SortTitleWidget:new{
+    self.title_bar = TitleBar:new{
+        width = self.dimen.w,
+        align = "left",
+        with_bottom_line = true,
+        bottom_line_color = Blitbuffer.COLOR_DARK_GRAY,
+        bottom_line_h_padding = padding,
         title = self.title,
-        width = self.item_width,
-        height = self.item_height,
-        use_top_page_count = self.use_top_page_count,
-        sort_page = self,
+        left_icon = not self.sort_disabled and "appbar.menu",
+        left_icon_tap_callback = function() self:onShowWidgetMenu() end,
+        close_callback = function() self:onClose() end,
+        show_parent = self,
     }
     -- setup main content
-    self.item_margin = self.item_height / 8
+    self.item_margin = math.floor(self.item_height / 8)
     local line_height = self.item_height + self.item_margin
-    local content_height = self.dimen.h - self.title_bar:getSize().h - vertical_footer:getSize().h - padding
+    local content_height = self.dimen.h - self.title_bar:getHeight() - vertical_footer:getSize().h - padding
     self.items_per_page = math.floor(content_height / line_height)
     self.pages = math.ceil(#self.item_table / self.items_per_page)
     self.main_content = VerticalGroup:new{}
 
     self:_populateItems()
 
+    local padding_below_title = 0
+    if self.pages > 1 then -- center content vertically
+        padding_below_title = (content_height - self.items_per_page * line_height) / 2
+    end
     local frame_content = FrameContainer:new{
         height = self.dimen.h,
-        padding = padding,
+        padding = 0,
         bordersize = 0,
         background = Blitbuffer.COLOR_WHITE,
         VerticalGroup:new{
-            align = "left",
             self.title_bar,
+            VerticalSpan:new{ width = padding_below_title },
             self.main_content,
         },
     }
@@ -356,29 +346,49 @@ function SortWidget:init()
     }
 end
 
-function SortWidget:nextPage()
-    local new_page = math.min(self.show_page+1, self.pages)
-    if new_page > self.show_page then
-        self.show_page = new_page
-        if self.marked > 0 then
-            self:moveItem(self.items_per_page * (self.show_page - 1) + 1 - self.marked)
+function SortWidget:registerKeyEvents()
+    if Device:hasKeys() then
+        self.key_events.CancelOrClose = { { Device.input.group.Back } }
+        self.key_events.NextPage = { { Device.input.group.PgFwd } }
+        self.key_events.PrevPage = { { Device.input.group.PgBack } }
+        self.key_events.ShowWidgetMenu = { { "Menu" } }
+        if Device:hasScreenKB() then
+            self.key_events.MoveUp = { { "ScreenKB", "Up" }, event = "MoveItemKB", args = -1 }
+            self.key_events.MoveDown = { { "ScreenKB", "Down" }, event = "MoveItemKB", args = 1 }
+            self.key_events.FirstPage = { { "ScreenKB", Device.input.group.PgBack }, event = "GoToPage", args = 1 }
+            self.key_events.LastPage = { { "ScreenKB", Device.input.group.PgFwd }, event = "GoToPage", args = self.pages }
+        elseif Device:hasKeyboard() then
+            self.key_events.MoveUp = { { "Shift", "Up" }, event = "MoveItemKB", args = -1 }
+            self.key_events.MoveDown = { { "Shift", "Down" }, event = "MoveItemKB", args = 1 }
+            self.key_events.FirstPage = { { "Shift", Device.input.group.PgBack }, event = "GoToPage", args = 1 }
+            self.key_events.LastPage = { { "Shift", Device.input.group.PgFwd }, event = "GoToPage", args = self.pages }
         end
-        self:_populateItems()
+    end
+end
+
+function SortWidget:nextPage()
+    if self.show_page < self.pages then
+        self.show_page = self.show_page + 1
+        if self.marked > 0 then -- put selected item first in the page
+            self:moveItem(self.items_per_page * (self.show_page - 1) + 1 - self.marked)
+        else
+            self:_populateItems()
+        end
     end
 end
 
 function SortWidget:prevPage()
-    local new_page = math.max(self.show_page-1, 1)
-    if new_page < self.show_page then
-        self.show_page = new_page
-        if self.marked > 0 then
+    if self.show_page > 1 then
+        self.show_page = self.show_page - 1
+        if self.marked > 0 then -- put selected item first in the page
             self:moveItem(self.items_per_page * (self.show_page - 1) + 1 - self.marked)
+        else
+            self:_populateItems()
         end
-        self:_populateItems()
     end
 end
 
-function SortWidget:goToPage(page)
+function SortWidget:onGoToPage(page)
     self.show_page = page
     self:_populateItems()
 end
@@ -386,15 +396,27 @@ end
 function SortWidget:moveItem(diff)
     local move_to = self.marked + diff
     if move_to > 0 and move_to <= #self.item_table then
-        self.show_page = math.ceil(move_to/self.items_per_page)
-        self:swapItems(self.marked, move_to)
+        -- Remember the original state to support Cancel
+        if not self.orig_item_table then
+            self.orig_item_table = util.tableDeepCopy(self.item_table)
+        end
+        table.insert(self.item_table, move_to, table.remove(self.item_table, self.marked))
+        self.show_page = math.ceil(move_to / self.items_per_page)
+        self.marked = move_to
         self:_populateItems()
     end
+end
+
+function SortWidget:onMoveItemKB(diff)
+    -- set self.marked to the item with focus
+    self.marked = self.selected.y + (self.show_page - 1) * self.items_per_page
+    self:moveItem(diff)
 end
 
 -- make sure self.item_margin and self.item_height are set before calling this
 function SortWidget:_populateItems()
     self.main_content:clear()
+    self.layout = { self.layout[#self.layout] } -- keep footer
     local idx_offset = (self.show_page - 1) * self.items_per_page
     local page_last
     if idx_offset + self.items_per_page <= #self.item_table then
@@ -402,57 +424,64 @@ function SortWidget:_populateItems()
     else
         page_last = #self.item_table
     end
-
     for idx = idx_offset + 1, page_last do
         table.insert(self.main_content, VerticalSpan:new{ width = self.item_margin })
         local invert_status = false
         if idx == self.marked then
             invert_status = true
         end
-        table.insert(
-            self.main_content,
-            SortItemWidget:new{
-                height = self.item_height,
-                width = self.item_width,
-                text = self.item_table[idx].text,
-                label = self.item_table[idx].label,
-                invert = invert_status,
-                index = idx,
-                show_parent = self,
-            }
-        )
+        local item = SortItemWidget:new{
+            height = self.item_height,
+            width = self.item_width,
+            item = self.item_table[idx],
+            invert = invert_status,
+            index = idx,
+            show_parent = self,
+        }
+        table.insert(self.layout, #self.layout, {item})
+        table.insert(self.main_content, item)
+    end
+    if self.marked == 0 then
+        -- Reset the focus to the top of the page when we're not moving an item (#12342)
+        self:moveFocusTo(1, 1)
+    else
+        -- Move focus to the moved item.
+        self:moveFocusTo(1, self.marked - idx_offset)
     end
 
-    self.footer_page:setText(T(_("%1 / %2"), self.show_page, self.pages), self.width_widget * 22 / 100)
-    local footer_first_up_text = "◀◀"
-    local footer_last_down_text = "▶▶"
+    -- NOTE: We forgo our usual "Page x of y" wording because of space constraints given the way the widget is currently built
+    self.footer_page:setText(T(C_("Pagination", "%1 / %2"), self.show_page, self.pages), self.footer_center_width)
+    if self.pages > 1 then
+        self.footer_page:enable()
+    else
+        self.footer_page:disableWithoutDimming()
+    end
+    local chevron_first = "chevron.first"
+    local chevron_last = "chevron.last"
     if BD.mirroredUILayout() then
-        footer_first_up_text, footer_last_down_text = footer_last_down_text, footer_first_up_text
+        chevron_first, chevron_last = chevron_last, chevron_first
     end
     if self.marked > 0 then
-        self.footer_first_up:setText("▲", self.width_widget * 13 / 100)
-        self.footer_last_down:setText("▼", self.width_widget * 13 / 100)
+        -- setIcon will recreate the frame, but we want to preserve the focus inversion
+        self.footer_cancel.preselect = self.footer_cancel.frame.invert
+        self.footer_cancel:setIcon("cancel", self.footer_button_width)
+        self.footer_cancel.callback = function() self:onCancel() end
+        self.footer_first_up:setIcon("move.up", self.footer_button_width)
+        self.footer_last_down:setIcon("move.down", self.footer_button_width)
     else
-        self.footer_first_up:setText(footer_first_up_text, self.width_widget * 13 / 100)
-        self.footer_last_down:setText(footer_last_down_text, self.width_widget * 13 / 100)
+        self.footer_cancel.preselect = self.footer_cancel.frame.invert
+        self.footer_cancel:setIcon("exit", self.footer_button_width)
+        self.footer_cancel.callback = function() self:onClose() end
+        self.footer_first_up:setIcon(chevron_first, self.footer_button_width)
+        self.footer_last_down:setIcon(chevron_last, self.footer_button_width)
     end
     self.footer_left:enableDisable(self.show_page > 1)
     self.footer_right:enableDisable(self.show_page < self.pages)
-    self.footer_first_up:enableDisable(self.show_page > 1 or self.marked > 0)
+    self.footer_first_up:enableDisable(self.show_page > 1 or (self.marked > 0 and self.marked > 1))
     self.footer_last_down:enableDisable(self.show_page < self.pages or (self.marked > 0 and self.marked < #self.item_table))
-
     UIManager:setDirty(self, function()
         return "ui", self.dimen
     end)
-end
-
-function SortWidget:swapItems(pos1, pos2)
-    if pos1 > 0 or pos2 <= #self.item_table then
-        local entry = self.item_table[pos1]
-        self.marked = pos2
-        self.item_table[pos1] = self.item_table[pos2]
-        self.item_table[pos2] = entry
-    end
 end
 
 function SortWidget:onNextPage()
@@ -486,15 +515,115 @@ function SortWidget:onSwipe(arg, ges_ev)
     end
 end
 
+function SortWidget:onShowWidgetMenu()
+    local dialog
+    local buttons = {
+        {{
+            text = _("Sort A to Z"),
+            align = "left",
+            callback = function()
+                UIManager:close(dialog)
+                self:sortItems("strcoll")
+            end,
+        }},
+        {{
+            text = _("Sort Z to A"),
+            align = "left",
+            callback = function()
+                UIManager:close(dialog)
+                self:sortItems("strcoll", true)
+            end,
+        }},
+        {{
+            text = _("Sort A to Z (natural)"),
+            align = "left",
+            callback = function()
+                UIManager:close(dialog)
+                self:sortItems("natural")
+            end,
+        }},
+        {{
+            text = _("Sort Z to A (natural)"),
+            align = "left",
+            callback = function()
+                UIManager:close(dialog)
+                self:sortItems("natural", true)
+            end,
+        }},
+    }
+    dialog = ButtonDialog:new{
+        shrink_unneeded_width = true,
+        buttons = buttons,
+        anchor = function()
+            return self.title_bar.left_button.image.dimen
+        end,
+    }
+    UIManager:show(dialog)
+    return true
+end
+
+function SortWidget:sortItems(collate, reverse_collate)
+    if not self.orig_item_table then
+        self.orig_item_table = util.tableDeepCopy(self.item_table)
+    end
+    local FileChooser = require("ui/widget/filechooser")
+    local sort_func = FileChooser:getSortingFunction(FileChooser.collates[collate], reverse_collate)
+    table.sort(self.item_table, sort_func)
+    self.show_page = 1
+    self.marked = 1 -- enable cancel button
+    self:_populateItems()
+end
+
 function SortWidget:onClose()
     UIManager:close(self)
     UIManager:setDirty(nil, "ui")
     return true
 end
 
+function SortWidget:onCancelOrClose()
+    if self.marked > 0 then
+        self:onCancel()
+    else
+        self:onClose()
+    end
+    return true
+end
+
+function SortWidget:onCancel()
+    self.marked = 0
+    if self.orig_item_table then
+        -- We can't break the reference to self.item_table, as that's what the callback uses to update the original data...
+        -- So, do this in two passes: empty it, then re-fill it from the copy.
+        for i = #self.item_table, 1, -1 do
+            self.item_table[i] = nil
+        end
+
+        for __, item in ipairs(self.orig_item_table) do
+            table.insert(self.item_table, item)
+        end
+
+        self.orig_item_table = nil
+    end
+
+    self:onGoToPage(self.show_page)
+    return true
+end
+
 function SortWidget:onReturn()
-    UIManager:close(self)
-    if self.callback then self:callback() end
+    -- The callback we were passed is usually responsible for passing along the re-ordered table itself,
+    -- as well as items' enabled flag, if any, meaning we have to honor it even if nothing was moved.
+    if self.callback then
+        self:callback()
+    end
+
+    -- If we're not in the middle of moving stuff around, just exit.
+    if self.marked == 0 then
+        return self:onClose()
+    end
+
+    self.marked = 0
+    self.orig_item_table = nil
+    self:onGoToPage(self.show_page)
     return true
 end
 
