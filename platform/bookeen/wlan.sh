@@ -42,10 +42,10 @@ start ()
 	else
 		return -2
 	fi
+  
+	wpa_supplicant -B -i wlan0 -C /var/run/wpa_supplicant
 	
-	wpa_supplicant -B -i wlan0 -c /mnt/fat/system/bin/ws.conf
-
-	return 0
+  return 0
 }
 
 suspend()
@@ -101,4 +101,3 @@ case "$1" in
 esac
 
 exit 0
-
