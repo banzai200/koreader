@@ -147,6 +147,7 @@ TARGET:
     macos                     MacOS app bundle
     pocketbook
     remarkable
+    bookeen
     sony-prstux
     ubuntu-touch
     win32
